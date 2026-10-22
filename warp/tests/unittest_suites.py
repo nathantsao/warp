@@ -254,6 +254,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.test_static import TestStatic
     from warp.tests.test_struct import TestStruct
     from warp.tests.test_subscript_types import TestSubscriptTypes
+    from warp.tests.test_sycl import TestSycl
     from warp.tests.test_tape import TestTape
     from warp.tests.test_template_launch_bounds import TestTemplateLaunchBounds
     from warp.tests.test_transient_module import TestTransientModule
@@ -354,6 +355,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestDeterministicOptions,
         TestDeterministicScatter,
         TestDevices,
+        TestSycl,
         TestDiagnostics,
         TestDLPack,
         TestEnum,

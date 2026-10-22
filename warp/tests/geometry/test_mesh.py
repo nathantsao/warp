@@ -461,7 +461,7 @@ class TestMesh(unittest.TestCase):
     def test_mesh_refit_raises_on_native_device_failure(self):
         mesh = wp.Mesh.__new__(wp.Mesh)
         mesh.id = 123
-        mesh.device = mock.Mock(is_cpu=False)
+        mesh.device = mock.Mock(is_cpu=False, is_sycl=False)
         mesh.runtime = mock.Mock()
         mesh.runtime.core.wp_mesh_refit_device.return_value = 0
         mesh.runtime.get_error_string.return_value = "native refit failure"
@@ -475,7 +475,7 @@ class TestMesh(unittest.TestCase):
 
         mesh = wp.Mesh.__new__(wp.Mesh)
         mesh.id = 123
-        mesh.device = mock.Mock(is_cpu=False)
+        mesh.device = mock.Mock(is_cpu=False, is_sycl=False)
         mesh._points = points
         mesh.runtime = mock.Mock()
         mesh.runtime.core.wp_mesh_set_points_device.return_value = 0

@@ -30,6 +30,7 @@ if(WIN32
 endif()
 
 option(WARP_BUILD_CLANG "Build warp-clang" ON)
+option(WARP_ENABLE_SYCL "Build the optional Intel SYCL runtime (Linux)" OFF)
 option(WARP_VERIFY_FP "Enable floating point verification" OFF)
 option(WARP_FAST_MATH "Enable fast math compiler options" OFF)
 set(WARP_LIBMATHDX_PATH "" CACHE PATH "")
@@ -84,6 +85,35 @@ warp_find_llvm()
 
 set(WARP_NATIVE_DIR "${PROJECT_SOURCE_DIR}/warp/native")
 set(WARP_BIN_DIR "${PROJECT_SOURCE_DIR}/warp/bin")
+
+if(WARP_ENABLE_SYCL)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR "SYCL builds are supported only on Linux")
+    endif()
+    find_program(WARP_SYCL_COMPILER NAMES icpx REQUIRED)
+    file(GLOB_RECURSE WARP_SYCL_HEADERS CONFIGURE_DEPENDS "${WARP_NATIVE_DIR}/*.h")
+    add_custom_command(
+        OUTPUT "${WARP_BIN_DIR}/warp-sycl.so"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${WARP_BIN_DIR}"
+        COMMAND "${WARP_SYCL_COMPILER}" -fsycl -std=c++17 -fPIC -shared
+                -fvisibility=hidden -DWP_BUILD_DLL
+                "$<IF:$<CONFIG:Debug>,-O0,-O2>"
+                "${WARP_NATIVE_DIR}/sycl_runtime.cpp"
+                "${WARP_NATIVE_DIR}/sycl_array.cpp"
+                "${WARP_NATIVE_DIR}/sycl_geometry.cpp"
+                "-L${WARP_BIN_DIR}" -l:warp.so "-Wl,-rpath,$ORIGIN"
+                -o "${WARP_BIN_DIR}/warp-sycl.so"
+        DEPENDS warp ${WARP_SYCL_HEADERS}
+                "${WARP_NATIVE_DIR}/sycl_runtime.cpp"
+                "${WARP_NATIVE_DIR}/sycl_array.cpp"
+                "${WARP_NATIVE_DIR}/sycl_geometry.cpp"
+                "${WARP_NATIVE_DIR}/sycl_runtime.h"
+                "${WARP_NATIVE_DIR}/version.h"
+                "${WARP_NATIVE_DIR}/api.h"
+        VERBATIM
+    )
+    add_custom_target(warp-sycl ALL DEPENDS "${WARP_BIN_DIR}/warp-sycl.so")
+endif()
 
 function(warp_set_shared_target_output target output_name)
     set_target_properties(

@@ -232,6 +232,61 @@ After building, the Warp package should be installed using:
 The ``-e`` option is optional but ensures that subsequent modifications to the
 library will be reflected in the Python package.
 
+Experimental Intel SYCL builds
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Linux source builds can enable an experimental Intel GPU backend. Install the
+Intel GPU driver/Level Zero runtime and Intel oneAPI DPC++ compiler, ensure your
+user can access the GPU render node, and initialize the oneAPI environment:
+
+.. code-block:: console
+
+    $ source /opt/intel/oneapi/setvars.sh
+    $ uv run build_lib.py --no-cuda --sycl
+    $ uv run --no-sync -m unittest warp.tests.test_sycl -v
+
+The compiler is found as ``icpx`` on ``PATH``; ``WARP_SYCL_COMPILER`` can select
+another compiler executable. Keep the oneAPI runtime environment available
+when importing Warp or compiling kernels. SYCL is opt-in and is not included
+in the standard prebuilt wheels. To build CUDA and SYCL together, omit
+``--no-cuda`` and configure the CUDA Toolkit normally.
+
+CMake builds use ``-DWARP_ENABLE_SYCL=ON`` and optionally
+``-DWARP_SYCL_COMPILER=/path/to/icpx``. The companion library is built after the
+core library and generated headers.
+
+Command-graph support is always compiled when SYCL is enabled; there is no
+separate graph build flag. The oneAPI compiler must provide the command-graph
+extension. Devices without graph support can still run ordinary kernels, but
+graph capture raises an error.
+
+Select the backend explicitly:
+
+.. code-block:: python
+
+    import warp as wp
+
+    device = wp.get_device("sycl:0")
+    values = wp.ones(1024, device=device)
+    # wp.launch(my_kernel, dim=values.size, inputs=[values], device=device)
+    result = values.numpy()  # explicit, synchronized host readback
+
+The first stage supports ordinary kernels and gradients, regular/strided
+arrays, basic cooperative tiles, BVH/mesh queries, and basic graph replay.
+It has been validated with oneAPI 2026.1.1 on Intel Arc Pro B70.
+SYCL remains distinct from CPU and CUDA; existing default-device selection
+does not change.
+
+There is no automatic CPU fallback. Geometry construction uses Warp's native
+host SAH/median builders, and winding-number refit is explicitly host-backed.
+Other unsupported operations raise errors. Advanced tile math/sort,
+array-wide native utilities, textures, volumes, hash grids, sparse matrices, indexed arrays,
+external streams, DLPack, conditional graphs, and graph serialization are not
+supported yet. Tiled kernels require full work-groups; subgroup width is not
+assumed to be 32. Graph capture uses a single queue, requires serialized host
+access, and does not allow allocations or host transfers. Keep geometry owners
+alive until graphs referencing their IDs are released.
+
 .. _windows-arm64-builds:
 
 Experimental Windows on Arm builds

@@ -230,6 +230,9 @@ def to_dlpack(wp_array: warp.array):
         to another array type without copying the underlying memory.
     """
 
+    if wp_array.device.is_sycl:
+        raise NotImplementedError("SYCL DLPack interoperability is not yet supported")
+
     # DLPack does not support structured arrays
     if isinstance(wp_array.dtype, warp._src.codegen.Struct):
         raise RuntimeError("Cannot convert structured Warp arrays to DLPack.")

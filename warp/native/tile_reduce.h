@@ -703,8 +703,12 @@ template <typename Tile, typename Op> auto tile_reduce_impl(Op f, Tile& t)
         // the barrier.
         // The redundant work is intentional: lane 0, or any sparse subset
         // of lanes, may already have returned from the logical block.
+#if defined(__SYCL_DEVICE_ONLY__)
+        has_data[tid] = false;
+#else
         for (int i = 0; i < WP_TILE_BLOCK_DIM; ++i)
             has_data[i] = false;
+#endif
         WP_TILE_SYNC();
 
         // Local partial. If a fiber has zero register slots (only possible at
@@ -808,8 +812,12 @@ auto tile_reduce_axis_impl(Op f, Tile& t, typename Tile::Type empty_identity, bo
         // operation or block.
         // Do not elect lane 0 as the initializer because it may have
         // returned while the remaining fibers continue this block.
+#if defined(__SYCL_DEVICE_ONLY__)
+        active[tid] = false;
+#else
         for (int i = 0; i < WP_TILE_BLOCK_DIM; ++i)
             active[i] = false;
+#endif
         WP_TILE_SYNC();
         active[tid] = true;
 

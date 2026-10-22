@@ -9,6 +9,11 @@
 
 #include "crt.h"
 
+#if defined(__SYCL_DEVICE_ONLY__)
+#include <sycl/ext/oneapi/experimental/builtins.hpp>
+#include <sycl/sycl.hpp>
+#endif
+
 #ifdef _WIN32
 #define __restrict__ __restrict
 #endif
@@ -84,6 +89,10 @@ __device__ inline void __debugbreak() { __brkpt(); }
 #endif
 
 namespace wp {
+
+#if defined(__SYCL_DEVICE_ONLY__)
+using sycl::ext::oneapi::experimental::printf;
+#endif
 
 // numeric types (used from generated kernels)
 typedef float float32;
@@ -2105,6 +2114,9 @@ CUDA_CALLABLE inline int slice_get_length(const slice_t& slice)
     return slice_get_length_unchecked(slice);
 }
 
+#if defined(__SYCL_DEVICE_ONLY__)
+#include "sycl_atomic.h"
+#else
 template <typename T> inline CUDA_CALLABLE T atomic_add(T* buf, T value)
 {
 #if !defined(__CUDA_ARCH__)
@@ -2437,6 +2449,8 @@ template <> inline CUDA_CALLABLE bfloat16 atomic_max(bfloat16* buf, bfloat16 val
 }
 #endif  // WP_NO_BFLOAT16
 
+#endif  // __SYCL_DEVICE_ONLY__
+
 // Adjoint of atomic min/max: accumulate gradient for each thread whose `value`
 // matched the slot the forward operator wrote. The standard equality test
 // catches the finite cases; the explicit both-NaN branch covers the case
@@ -2454,6 +2468,7 @@ template <typename T> CUDA_CALLABLE inline void adj_atomic_minmax(T* addr, T* ad
 CUDA_CALLABLE inline void adj_atomic_minmax(bool* buf, bool* adj_buf, const bool& value, bool& adj_value) { }
 
 
+#if !defined(__SYCL_DEVICE_ONLY__)
 template <typename T> inline CUDA_CALLABLE T atomic_cas(T* address, T compare, T val)
 {
 #if defined(__CUDA_ARCH__)
@@ -2554,6 +2569,8 @@ template <> inline CUDA_CALLABLE int64 atomic_exch(int64* address, int64 val)
 }
 
 
+#endif  // !__SYCL_DEVICE_ONLY__
+
 template <typename T>
 CUDA_CALLABLE inline void
 adj_atomic_cas(T* address, T compare, T val, T* adj_address, T& adj_compare, T& adj_val, T adj_ret)
@@ -2568,6 +2585,7 @@ CUDA_CALLABLE inline void adj_atomic_exch(T* address, T val, T* adj_address, T& 
 }
 
 
+#if !defined(__SYCL_DEVICE_ONLY__)
 template <typename T> inline CUDA_CALLABLE T atomic_and(T* buf, T value)
 {
 #if defined(__CUDA_ARCH__)
@@ -2600,7 +2618,7 @@ template <typename T> inline CUDA_CALLABLE T atomic_xor(T* buf, T value)
     return old;
 #endif
 }
-
+#endif  // !__SYCL_DEVICE_ONLY__
 
 }  // namespace wp
 

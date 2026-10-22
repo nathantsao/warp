@@ -161,6 +161,8 @@ class BsrMatrix(Generic[_BlockType]):
     @property
     def device(self) -> wp._src.context.Device:
         """Device on which matrix arrays are allocated."""
+        if self.offsets.device.is_sycl:
+            raise NotImplementedError("SYCL sparse matrices are not yet supported")
         return self.offsets.device
 
     @property
@@ -696,6 +698,8 @@ def bsr_zeros(
           a host readback.
     """
 
+    if wp.get_device(device).is_sycl:
+        raise NotImplementedError("SYCL sparse matrices are not yet supported")
     if topology is None:
         topology = "padded" if row_capacity is not None else "compact"
     elif topology not in ("compact", "padded"):

@@ -250,8 +250,12 @@ template <typename Tile, typename Op = OpAdd<typename Tile::Type>> inline auto t
         // fibers that participate and skip all other slots below.
         // Every live fiber clears all flags so initialization remains valid
         // when lane 0, or a sparse set of lanes, has already returned.
+#if defined(__SYCL_DEVICE_ONLY__)
+        active[tid] = false;
+#else
         for (int i = 0; i < WP_TILE_BLOCK_DIM; ++i)
             active[i] = false;
+#endif
         WP_TILE_SYNC();
         active[tid] = true;
 
@@ -303,8 +307,12 @@ template <typename Tile, typename Op = OpAdd<typename Tile::Type>> inline auto t
         bool* active = (bool*)tile_shared_storage_t::alloc(int(sizeof(bool) * WP_TILE_BLOCK_DIM));
         const int tid = WP_TILE_THREAD_IDX;
 
+#if defined(__SYCL_DEVICE_ONLY__)
+        active[tid] = false;
+#else
         for (int i = 0; i < WP_TILE_BLOCK_DIM; ++i)
             active[i] = false;
+#endif
         WP_TILE_SYNC();
         active[tid] = true;
 

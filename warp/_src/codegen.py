@@ -2381,6 +2381,9 @@ class Adjoint:
                     arg_strs.append(f"{a.namespace}{a.native_func}")
                 else:
                     arg_strs.append(f"{a.namespace}{prefix}_{a.native_func}")
+                if adj.builder is not None and adj.builder.options.get("target_backend") == "sycl":
+                    symbol = arg_strs[-1]
+                    arg_strs[-1] = f"[](auto&&... args) {{ return {symbol}(args...); }}"
             elif is_reference(a.type):
                 arg_strs.append(a.emit(prefix))
             elif isinstance(a, Var):
@@ -2861,6 +2864,21 @@ class Adjoint:
             arg_nodes=arg_nodes,
             kwarg_nodes=kwarg_nodes,
         )
+        if adj.builder is not None and adj.builder.options.get("target_backend") == "sycl":
+            if func.is_builtin() and (
+                func.key.startswith(("volume_", "hash_grid_", "texture_"))
+                or func.key
+                in (
+                    "tile_sort",
+                    "tile_fft",
+                    "tile_ifft",
+                    "tile_matmul",
+                    "tile_cholesky",
+                    "tile_cholesky_solve",
+                    "tile_solve",
+                )
+            ):
+                raise WarpCodegenError(f"{func.key}() is not yet supported on SYCL")
 
         def return_value(output):
             if return_resolved:
@@ -7158,6 +7176,20 @@ cpu_module_header = """
 
 """
 
+sycl_module_header = """
+#define WP_TILE_BLOCK_DIM {block_dim}
+#define WP_SYCL_SHARED_BYTES {shared_bytes}
+#include "sycl_runtime.h"
+#include "builtin.h"
+#include "deterministic.h"
+
+#define builtin_tid1d() wp::tid(task_index, dim)
+#define builtin_tid2d(x, y) wp::tid(x, y, task_index, dim)
+#define builtin_tid3d(x, y, z) wp::tid(x, y, z, task_index, dim)
+#define builtin_tid4d(x, y, z, w) wp::tid(x, y, z, w, task_index, dim)
+#define builtin_block_dim() wp::block_dim()
+"""
+
 cuda_module_header = """
 #define WP_TILE_BLOCK_DIM {block_dim}
 #define WP_NO_CRT
@@ -7449,7 +7481,7 @@ def cuda_kernel_backward_name(kernel, name=None):
 
 cpu_kernel_template_forward = """
 
-void {name}_cpu_kernel_forward(
+{kernel_inline}void {name}_{backend}_kernel_forward(
     {forward_args},
     wp_args_{name} *_wp_args)
 {{
@@ -7459,7 +7491,7 @@ void {name}_cpu_kernel_forward(
 
 cpu_kernel_template_backward = """
 
-void {name}_cpu_kernel_backward(
+{kernel_inline}void {name}_{backend}_kernel_backward(
     {reverse_args},
     wp_args_{name} *_wp_args,
     wp_args_{name} *_wp_adj_args)
@@ -7879,7 +7911,7 @@ def codegen_struct(struct, device="cpu", indent_size=4, include_tile_helpers=Fal
 
 
 def codegen_func_forward(adj, func_type="kernel", device="cpu", grid_stride=False):
-    if device == "cpu":
+    if device in ("cpu", "sycl"):
         indent = 4
     elif device == "cuda":
         if func_type == "kernel":
@@ -7894,7 +7926,7 @@ def codegen_func_forward(adj, func_type="kernel", device="cpu", grid_stride=Fals
     lines = []
 
     # argument vars
-    if device == "cpu" and func_type == "kernel":
+    if device in ("cpu", "sycl") and func_type == "kernel":
         lines += ["//---------\n"]
         lines += ["// argument vars\n"]
 
@@ -7935,7 +7967,7 @@ def codegen_func_reverse(adj, func_type="kernel", device="cpu", grid_stride=Fals
     if adj.slot_augassign_error is not None:
         raise WarpCodegenError(adj.slot_augassign_error)
 
-    if device == "cpu":
+    if device in ("cpu", "sycl"):
         indent = 4
     elif device == "cuda":
         if func_type == "kernel":
@@ -7950,7 +7982,7 @@ def codegen_func_reverse(adj, func_type="kernel", device="cpu", grid_stride=Fals
     lines = []
 
     # argument vars
-    if device == "cpu" and func_type == "kernel":
+    if device in ("cpu", "sycl") and func_type == "kernel":
         lines += ["//---------\n"]
         lines += ["// argument vars\n"]
 
@@ -8145,7 +8177,7 @@ def codegen_func(
     if template_params:
         template_prefix = "template<" + ", ".join(f"typename {t}" for t in template_params) + ">\n"
 
-    if device == "cpu":
+    if device in ("cpu", "sycl"):
         forward_template = cpu_forward_function_template
         reverse_template = cpu_reverse_function_template
     elif device == "cuda":
@@ -8334,7 +8366,7 @@ def codegen_kernel(kernel, device, options):
     adj = kernel.adj
 
     args_struct = ""
-    if device == "cpu":
+    if device in ("cpu", "sycl"):
         args_struct = f"struct wp_args_{kernel.get_mangled_name()} {{\n"
         for i in adj.args:
             args_struct += f"    {i.ctype()} {i.label};\n"
@@ -8382,7 +8414,7 @@ def codegen_kernel(kernel, device, options):
             "external entry-point runtimes such as OptiX do not accept Warp's shared-memory allocator."
         )
 
-    if device == "cpu":
+    if device in ("cpu", "sycl"):
         template_forward = cpu_kernel_template_forward
         template_backward = cpu_kernel_template_backward
     elif is_external_constant_params_entry:
@@ -8401,6 +8433,8 @@ def codegen_kernel(kernel, device, options):
     template = ""
     template_fmt_args = {
         "name": kernel.get_mangled_name(),
+        "backend": device,
+        "kernel_inline": "inline " if device == "sycl" else "",
         "forward_name": cuda_kernel_forward_name(kernel) if device == "cuda" else kernel.get_mangled_name(),
         "backward_name": cuda_kernel_backward_name(kernel) if device == "cuda" else kernel.get_mangled_name(),
         "launch_ndim": kernel.adj.kernel_dim,
@@ -8449,7 +8483,7 @@ def codegen_kernel(kernel, device, options):
     forward_args = []
     if not is_external_constant_params_entry:
         forward_args.append(f"wp::launch_bounds_t<{adj.kernel_dim}> dim")
-    if device == "cpu":
+    if device in ("cpu", "sycl"):
         forward_args.append("size_t task_index")
     elif not is_external_constant_params_entry:
         for arg in adj.args:
@@ -8465,7 +8499,7 @@ def codegen_kernel(kernel, device, options):
             "Warp struct argument."
         )
 
-    if not is_external_constant_params_entry and device != "cpu":
+    if not is_external_constant_params_entry and device == "cuda":
         forward_args.extend(adj.deterministic.kernel_args())
 
     forward_func_type = "function" if is_external_constant_params_entry else "kernel"
@@ -8493,7 +8527,7 @@ def codegen_kernel(kernel, device, options):
     if options["enable_backward"] and not is_external_constant_params_entry:
         # build reverse signature
         reverse_args = [f"wp::launch_bounds_t<{adj.kernel_dim}> dim"]
-        if device == "cpu":
+        if device in ("cpu", "sycl"):
             reverse_args.append("size_t task_index")
         else:
             for arg in adj.args:
@@ -8531,7 +8565,71 @@ def codegen_kernel(kernel, device, options):
     return args_struct + s
 
 
+def codegen_sycl_module(kernel, options):
+    adj = kernel.adj
+    if options.get("cluster_dim", 1) != 1:
+        raise WarpCodegenError("SYCL does not support CUDA thread-block clusters")
+    if adj.det_meta is not None and adj.det_meta.needs_deterministic:
+        raise WarpCodegenError("Deterministic lowering is not yet supported on SYCL")
+    pending = [adj]
+    visited = set()
+    uses_tiles = False
+    while pending:
+        function_adj = pending.pop()
+        if function_adj in visited:
+            continue
+        visited.add(function_adj)
+        uses_tiles |= any(is_tile(var.type) or is_tile_stack(var.type) for var in function_adj.variables)
+        pending.extend(function.adj for function in function_adj.called_user_functions)
+    name = kernel.get_mangled_name()
+    source = ""
+    for direction in ("forward", "backward") if options["enable_backward"] else ("forward",):
+        backward = direction == "backward"
+        adj_param = f", wp_args_{name}* adj_args" if backward else ""
+        adj_capture = "    const auto adj_values = *adj_args;\n" if backward else ""
+        adj_local = "            auto local_adj_args = adj_values;\n" if backward else ""
+        adj_call = ", &local_adj_args" if backward else ""
+        tile_init = "            wp::tile_shared_storage_t tile_storage;\n" if uses_tiles else ""
+        tile_validate = (
+            "        if (dim.size % local_size != 0)\n"
+            '            throw std::runtime_error("SYCL tile launches require complete work-groups");\n'
+            if uses_tiles
+            else ""
+        )
+        source += f"""
+template <int BlockDim, int SharedBytes> class {name}_sycl_{direction}_tag;
+
+extern "C" WP_API int {name}_sycl_{direction}(
+    void* device, wp::launch_bounds_t<{adj.kernel_dim}>* bounds, wp_args_{name}* args{adj_param})
+{{
+    const auto dim = *bounds;
+    const auto values = *args;
+{adj_capture}
+    return wp::sycl_checked([&] {{
+        if (dim.size == 0)
+            return;
+        constexpr size_t local_size = {options["block_dim"]};
+{tile_validate}
+        const size_t global_size = ((dim.size + local_size - 1) / local_size) * local_size;
+        wp::sycl_queue(device).parallel_for<{name}_sycl_{direction}_tag<local_size, WP_SYCL_SHARED_BYTES>>(
+            sycl::nd_range<1>(global_size, local_size), [=](sycl::nd_item<1> item) {{
+            const size_t task_index = item.get_global_linear_id();
+            if (task_index >= dim.size)
+                return;
+{tile_init}
+            auto local_args = values;
+{adj_local}
+            {name}_sycl_kernel_{direction}(dim, task_index, &local_args{adj_call});
+        }});
+    }});
+}}
+"""
+    return source
+
+
 def codegen_module(kernel, device, options):
+    if device == "sycl":
+        return codegen_sycl_module(kernel, options | kernel.options)
     if device != "cpu":
         return ""
 

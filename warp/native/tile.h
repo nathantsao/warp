@@ -5,7 +5,12 @@
 
 // Internal lane-participation masks for tile warp collectives, not logical
 // tile masks. Keep this block before builtin.h because its tile headers use it.
+#if defined(__SYCL_DEVICE_ONLY__)
+#include "sycl_tile.h"
+#define WP_TILE_WARP_SIZE (wp::sycl_work_item().get_sub_group().get_local_linear_range())
+#else
 #define WP_TILE_WARP_SIZE 32
+#endif
 
 #define WP_TILE_LANE_MASK_ALL 0xffffffffu
 #define WP_TILE_LANE_MASK_POPC(mask) __popc(mask)
@@ -51,6 +56,11 @@ struct alignas(16) float4 {
 
 #if defined(__CUDA_ARCH__)
 #define WP_TILE_SYNC __syncthreads
+#elif defined(__SYCL_DEVICE_ONLY__)
+namespace wp {
+template <typename T> struct wp_block_shared;
+}
+#define WP_TILE_SYNC ::wp::sycl_tile_sync
 #else
 namespace wp {
 
@@ -94,6 +104,8 @@ template <> struct wp_is_null_func<int> {
 
 #if defined(__CUDA_ARCH__) || defined(__CUDACC_RTC__) || (defined(__clang__) && defined(__CUDA__))
 #define WP_TILE_THREAD_IDX threadIdx.x
+#elif defined(__SYCL_DEVICE_ONLY__)
+#define WP_TILE_THREAD_IDX (int(wp::sycl_work_item().get_local_linear_id()))
 #else
 // Preserve the literal-zero specialization in unoptimized CPU debug builds.
 namespace wp {
@@ -1235,6 +1247,8 @@ private:
 #if defined(__CUDA_ARCH__)
         __shared__ unsigned int smem_base[WP_TILE_BLOCK_DIM];
         return smem_base;
+#elif defined(__SYCL_DEVICE_ONLY__)
+        return sycl_tile_offsets();
 #elif defined(WP_ENABLE_TILES_IN_STACK_MEMORY)
         return shared_tile_storage->smem_base;
 #else
@@ -1248,6 +1262,8 @@ private:
 #if defined(__CUDA_ARCH__)
         extern __shared__ char dynamic_smem_base[];
         return dynamic_smem_base;
+#elif defined(__SYCL_DEVICE_ONLY__)
+        return sycl_tile_storage();
 #elif defined(WP_ENABLE_TILES_IN_STACK_MEMORY)
         return shared_tile_storage->dynamic_smem_base;
 #else
@@ -1299,7 +1315,7 @@ public:
     {
         unsigned int* smem_base = get_smem_base();
 
-#if defined(__CUDA_ARCH__)
+#if defined(__CUDA_ARCH__) || defined(__SYCL_DEVICE_ONLY__)
         smem_base[WP_TILE_THREAD_IDX] = 0;
 #else
         if constexpr (WP_TILE_BLOCK_DIM == 1) {
@@ -1315,7 +1331,7 @@ public:
     {
         unsigned int* smem_base = get_smem_base();
 
-#if defined(__CUDA_ARCH__)
+#if defined(__CUDA_ARCH__) || defined(__SYCL_DEVICE_ONLY__)
         assert(smem_base[WP_TILE_THREAD_IDX] == 0);
 #else
         if constexpr (WP_TILE_BLOCK_DIM == 1) {
@@ -1332,12 +1348,16 @@ public:
         unsigned int* smem_base = get_smem_base();
         char* dynamic_smem_base = get_dynamic_smem_base();
 
-#if defined(__CUDA_ARCH__)
+#if defined(__CUDA_ARCH__) || defined(__SYCL_DEVICE_ONLY__)
         // Keep this path separate from the checked CPU arithmetic below. NVRTC
         // targeting sm_89 otherwise fails to hoist repeated shared-memory
         // address calculations in tiled kernels.
         const unsigned int offset = smem_base[WP_TILE_THREAD_IDX];
 
+#if defined(__SYCL_DEVICE_ONLY__)
+        assert(static_cast<long long>(offset) + tile_align(num_bytes) >= 0);
+        assert(static_cast<long long>(offset) + tile_align(num_bytes) <= WP_SYCL_SHARED_BYTES);
+#endif
         // one entry per-thread so no need for synchronization
         smem_base[WP_TILE_THREAD_IDX] += tile_align(num_bytes);
 #else

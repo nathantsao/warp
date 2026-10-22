@@ -4085,6 +4085,8 @@ class array(Array[DType, NDim]):
         if self.device is None:
             raise RuntimeError("Array has no device assigned")
 
+        if self.device.is_sycl:
+            raise NotImplementedError("SYCL DLPack interoperability is not yet supported")
         if self.device.is_cuda:
             return (warp._src.dlpack.DLDeviceType.kDLCUDA, self.device.ordinal)
         elif self.pinned:
@@ -4388,6 +4390,8 @@ class array(Array[DType, NDim]):
             self.mark_init()
             return
         self._apic_ensure_tracked()
+        if self.device.is_sycl and self.device.is_capturing:
+            self.device.captures[None]._sycl_refs.append(self)
         if self.is_contiguous:
             # simple memset is usually faster than generic fill
             self.device.memset(self.ptr, 0, self.size * type_size_in_bytes(self.dtype))
@@ -4467,6 +4471,9 @@ class array(Array[DType, NDim]):
         cvalue_ptr = ctypes.pointer(cvalue)
         cvalue_size = ctypes.sizeof(cvalue)
 
+        if self.device.is_sycl and self.device.is_capturing:
+            self.device.captures[None]._sycl_refs.append(self)
+
         # prefer using memtile for contiguous arrays, because it should be faster than generic fill
         if self.is_contiguous:
             # Large multi-byte fills (> WP_FILL_VALUE_INLINE_BYTES_2 = 3968 bytes,
@@ -4502,7 +4509,16 @@ class array(Array[DType, NDim]):
             carr = self.__ctype__()
             carr_ptr = ctypes.pointer(carr)
 
-            if self.device.is_cuda:
+            if self.device.is_sycl:
+                from warp._src.sycl import check  # noqa: PLC0415
+
+                check(
+                    warp._src.context.runtime.sycl,
+                    warp._src.context.runtime.sycl.wp_sycl_array_fill(
+                        self.device.context, carr_ptr, cvalue_ptr, cvalue_size, self.size
+                    ),
+                )
+            elif self.device.is_cuda:
                 warp._src.context.runtime.core.wp_array_fill_device(
                     self.device.context, carr_ptr, ARRAY_TYPE_REGULAR, cvalue_ptr, cvalue_size
                 )
@@ -5251,6 +5267,8 @@ class noncontiguous_array_base(Array[DType, NDim]):
         ctype = self.__ctype__()
         ctype_ptr = ctypes.pointer(ctype)
 
+        if self.device.is_sycl:
+            raise NotImplementedError("SYCL fills currently require regular Warp arrays")
         if self.device.is_cuda:
             warp._src.context.runtime.core.wp_array_fill_device(
                 self.device.context, ctype_ptr, self.type_id, cvalue_ptr, cvalue_size
@@ -5305,6 +5323,8 @@ class indexedarray(noncontiguous_array_base[DType, NDim]):
         if data is not None:
             if not isinstance(data, array):
                 raise ValueError("Indexed array data must be a Warp array")
+            if data.device.is_sycl:
+                raise NotImplementedError("SYCL indexed arrays are not yet supported")
             if dtype is not None and dtype != data.dtype:
                 raise ValueError(f"Requested dtype ({dtype}) does not match dtype of data array ({data.dtype})")
             if ndim is not None and ndim != data.ndim:
@@ -5944,7 +5964,7 @@ class Bvh:
         self.runtime = warp._src.context.runtime
 
         if constructor is None:
-            if self.device.is_cpu:
+            if self.device.is_cpu or self.device.is_sycl:
                 constructor = BvhConstructor.SAH
             else:
                 constructor = BvhConstructor.LBVH
@@ -5959,7 +5979,21 @@ class Bvh:
         if leaf_size < 1:
             raise ValueError(f"leaf_size must be greater than or equal to 1, current value: {leaf_size}")
 
-        if self.device.is_cpu:
+        if self.device.is_sycl:
+            from warp._src.sycl import check  # noqa: PLC0415
+
+            self.id = self.runtime.sycl.wp_sycl_bvh_create(
+                self.device.context,
+                get_data(lowers),
+                get_data(uppers),
+                len(lowers),
+                constructor,
+                get_data(groups),
+                leaf_size,
+            )
+            if not self.id:
+                check(self.runtime.sycl, -1)
+        elif self.device.is_cpu:
             if constructor == BvhConstructor.LBVH:
                 log_warning(
                     "LBVH constructor is not available for a CPU tree. Falling back to SAH constructor.", stacklevel=2
@@ -5994,7 +6028,11 @@ class Bvh:
             return
 
         try:
-            if self.device.is_cpu:
+            if self.device.is_sycl:
+                from warp._src.sycl import check  # noqa: PLC0415
+
+                check(self.runtime.sycl, self.runtime.sycl.wp_sycl_bvh_destroy(self.id))
+            elif self.device.is_cpu:
                 self.runtime.core.wp_bvh_destroy_host(self.id)
             else:
                 # use CUDA context guard to avoid side effects during garbage collection
@@ -6015,7 +6053,13 @@ class Bvh:
             with :func:`warp.capture_save`.
         """
 
-        if self.device.is_cpu:
+        if self.device.is_sycl:
+            from warp._src.sycl import check  # noqa: PLC0415
+
+            if self.device.is_capturing:
+                self.device.captures[None]._sycl_refs.append(self)
+            check(self.runtime.sycl, self.runtime.sycl.wp_sycl_bvh_refit(self.id))
+        elif self.device.is_cpu:
             self.runtime.core.wp_bvh_refit_host(self.id)
         else:
             self.runtime.core.wp_bvh_refit_device(self.id)
@@ -6055,6 +6099,14 @@ class Bvh:
         Raises:
             ValueError: If an unknown constructor is provided.
         """
+
+        if self.device.is_sycl:
+            from warp._src.sycl import check  # noqa: PLC0415
+
+            constructor = self._constructor if constructor is None else BvhConstructor.from_str(constructor)
+            check(self.runtime.sycl, self.runtime.sycl.wp_sycl_bvh_rebuild(self.id, constructor))
+            self._constructor = constructor
+            return
 
         if constructor is None and self._constructor == BvhConstructor.CUBQL:
             constructor = BvhConstructor.CUBQL
@@ -6175,6 +6227,9 @@ class Mesh:
                 raise RuntimeError("groups must have the same length as indices / 3")
 
         self.device = points.device
+        if self.device.is_sycl and velocities is not None:
+            if velocities.device != self.device or velocities.shape != points.shape:
+                raise ValueError("SYCL mesh velocities must match the points' device and shape")
         self._points = points
         self._velocities = velocities
         self.indices = indices
@@ -6185,7 +6240,7 @@ class Mesh:
         self.runtime = warp._src.context.runtime
 
         if bvh_constructor is None:
-            if self.device.is_cpu:
+            if self.device.is_cpu or self.device.is_sycl:
                 bvh_constructor = BvhConstructor.SAH
             else:
                 bvh_constructor = BvhConstructor.LBVH
@@ -6208,7 +6263,24 @@ class Mesh:
             elif bvh_leaf_size < 1:
                 raise ValueError(f"bvh_leaf_size must be greater than or equal to 1, current value: {bvh_leaf_size}")
 
-        if self.device.is_cpu:
+        if self.device.is_sycl:
+            from warp._src.sycl import check  # noqa: PLC0415
+
+            self.id = self.runtime.sycl.wp_sycl_mesh_create(
+                self.device.context,
+                points.__ctype__(),
+                velocities.__ctype__() if velocities else array().__ctype__(),
+                indices.__ctype__(),
+                len(points),
+                int(indices.size // 3),
+                int(support_winding_number),
+                bvh_constructor,
+                ctypes.c_void_p(groups.ptr) if groups else ctypes.c_void_p(0),
+                bvh_leaf_size,
+            )
+            if not self.id:
+                check(self.runtime.sycl, -1)
+        elif self.device.is_cpu:
             if bvh_constructor == BvhConstructor.LBVH:
                 log_warning(
                     "LBVH constructor is not available for a CPU tree. Falling back to SAH constructor.", stacklevel=2
@@ -6248,7 +6320,11 @@ class Mesh:
             return
 
         try:
-            if self.device.is_cpu:
+            if self.device.is_sycl:
+                from warp._src.sycl import check  # noqa: PLC0415
+
+                check(self.runtime.sycl, self.runtime.sycl.wp_sycl_mesh_destroy(self.id))
+            elif self.device.is_cpu:
                 self.runtime.core.wp_mesh_destroy_host(self.id)
             else:
                 # use CUDA context guard to avoid side effects during garbage collection
@@ -6264,7 +6340,13 @@ class Mesh:
         This should be called after users modify the ``points`` data.
         """
 
-        if self.device.is_cpu:
+        if self.device.is_sycl:
+            from warp._src.sycl import check  # noqa: PLC0415
+
+            if self.device.is_capturing:
+                self.device.captures[None]._sycl_refs.append(self)
+            check(self.runtime.sycl, self.runtime.sycl.wp_sycl_mesh_refit(self.id))
+        elif self.device.is_cpu:
             self.runtime.core.wp_mesh_refit_host(self.id)
         else:
             if not self.runtime.core.wp_mesh_refit_device(self.id):
@@ -6296,6 +6378,15 @@ class Mesh:
                 f"new points' shape is {points_new.shape}, while the old points' shape is {self._points.shape}."
             )
 
+        if self.device.is_sycl:
+            from warp._src.sycl import check  # noqa: PLC0415
+
+            if points_new.dtype != vec3 or not points_new.is_contiguous:
+                raise ValueError("SYCL mesh points must be a contiguous array of type wp.vec3")
+            check(self.runtime.sycl, self.runtime.sycl.wp_sycl_mesh_set_points(self.id, points_new.__ctype__()))
+            self._points = points_new
+            return
+
         self._points = points_new
         if self.device.is_cpu:
             self.runtime.core.wp_mesh_set_points_host(self.id, points_new.__ctype__())
@@ -6315,6 +6406,23 @@ class Mesh:
 
     @velocities.setter
     def velocities(self, velocities_new):
+        if self.device.is_sycl:
+            from warp._src.sycl import check  # noqa: PLC0415
+
+            if (
+                velocities_new.device != self.device
+                or velocities_new.shape != self._points.shape
+                or velocities_new.dtype != vec3
+                or not velocities_new.is_contiguous
+            ):
+                raise ValueError("SYCL mesh velocities must be contiguous wp.vec3 values matching the points")
+            check(
+                self.runtime.sycl,
+                self.runtime.sycl.wp_sycl_mesh_set_velocities(self.id, velocities_new.__ctype__()),
+            )
+            self._velocities = velocities_new
+            return
+
         if velocities_new.device != self._velocities.device:
             raise RuntimeError(
                 "The new points and the original points must live on the same device, the "
@@ -6403,6 +6511,8 @@ class Volume:
             return
         self.device = data.device
 
+        if self.device.is_sycl:
+            raise NotImplementedError("SYCL volumes are not yet supported")
         owner = False
         if self.device.is_cpu:
             self.id = self.runtime.core.wp_volume_create_host(
@@ -7345,6 +7455,8 @@ class Volume:
         """
         device = warp.get_device(device)
 
+        if device.is_sycl:
+            raise NotImplementedError("SYCL volumes are not yet supported")
         if not _is_contiguous_vec_like_array(tile_points, vec_length=3, scalar_types=(float32, int32)):
             raise RuntimeError(
                 "tile_points must be contiguous and either a 1D Warp array of vec3f or vec3i or a 2D n-by-3 array of int32 or float32."
@@ -7554,6 +7666,8 @@ class Volume:
         """
         device = warp.get_device(device)
 
+        if device.is_sycl:
+            raise NotImplementedError("SYCL volumes are not yet supported")
         if not _is_contiguous_vec_like_array(voxel_points, vec_length=3, scalar_types=(float32, int32)):
             raise RuntimeError(
                 "voxel_points must be contiguous and either a 1D Warp array of vec3f or vec3i or a 2D n-by-3 array of int32 or float32."
@@ -8000,6 +8114,8 @@ class HashGrid:
 
         self.runtime = warp._src.context.runtime
         self.device = self.runtime.get_device(device)
+        if self.device.is_sycl:
+            raise NotImplementedError("SYCL hash grids are not yet supported")
         try:
             self._dim_x = operator.index(dim_x)
             self._dim_y = operator.index(dim_y)

@@ -279,6 +279,8 @@ class Texture:
         # self.runtime *after* this call to ensure it is not None.
         device = warp._src.context.get_device(device)
         self._runtime = warp._src.context.runtime
+        if device.is_sycl:
+            raise NotImplementedError("SYCL textures are not yet supported")
 
         # Resolve address modes
         address_mode_u = self._resolve_address_mode(address_mode, address_mode_u, 0)

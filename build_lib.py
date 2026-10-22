@@ -324,6 +324,12 @@ def main(argv: list[str] | None = None) -> int:
     # Build options
     group_build = parser.add_argument_group("Build Options")
     group_build.add_argument(
+        "--sycl",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Build the optional Intel SYCL runtime (Linux, requires icpx on PATH)",
+    )
+    group_build.add_argument(
         "--cuda",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -411,6 +417,9 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
+
+    if args.sycl and sys.platform != "linux":
+        parser.error("--sycl is supported only on Linux")
 
     # Validate mutually exclusive LLVM options
     if args.llvm_path and args.build_llvm:
@@ -636,6 +645,11 @@ def main(argv: list[str] | None = None) -> int:
             if args.standalone:
                 build_llvm.build_llvm_clang_from_source(args)
                 build_llvm.build_warp_clang(args, lib_name("warp-clang"))
+
+        if args.sycl:
+            from warp._src.build_sycl import build_runtime  # noqa: PLC0415
+
+            build_runtime(os.path.join(build_path, "bin", "warp-sycl.so"), args.mode)
 
     except Exception as e:
         print(f"Warp build error: {e}")

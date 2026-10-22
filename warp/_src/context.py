@@ -3681,7 +3681,7 @@ class ModuleBuilder:
         source = ""
         constant_params_ctype = None
 
-        if device != "cpu":
+        if device == "cuda":
             for kernel in self.kernels:
                 if kernel.options.get("entry_point_abi") != "external_constant_params":
                     continue
@@ -3818,6 +3818,11 @@ class ModuleBuilder:
         if device == "cpu":
             extra_preamble = self.options.get("extra_cpu_preamble", "")
             module_header = warp._src.codegen.cpu_module_header.format(block_dim=self.options["block_dim"])
+        elif device == "sycl":
+            extra_preamble = ""
+            module_header = warp._src.codegen.sycl_module_header.format(
+                block_dim=self.options["block_dim"], shared_bytes=self.options["sycl_shared_bytes"]
+            )
         else:
             extra_preamble = self.options.get("extra_cuda_preamble", "")
             module_header = warp._src.codegen.cuda_module_header.format(block_dim=self.options["block_dim"])
@@ -3876,6 +3881,10 @@ class ModuleExec:
                     # use CUDA context guard to avoid side effects during garbage collection
                     with self.device.context_guard:
                         runtime.core.wp_cuda_unload_module(self.device.context, self.handle)
+                elif self.device.is_sycl:
+                    from warp._src.sycl import check  # noqa: PLC0415
+
+                    check(runtime.sycl, runtime.sycl.wp_sycl_unload_module(self.device.context, self.handle))
                 else:
                     runtime.llvm.wp_unload_obj(self.handle.encode("utf-8"))
             except (TypeError, AttributeError):
@@ -4027,6 +4036,16 @@ class ModuleExec:
                 backward_smem_shortfall=backward_smem_shortfall,
             )
 
+        elif self.device.is_sycl:
+            from warp._src.sycl import kernel_hook  # noqa: PLC0415
+
+            forward = kernel_hook(self.device, self.handle, name + "_sycl_forward", False)
+            backward = (
+                kernel_hook(self.device, self.handle, name + "_sycl_backward", True)
+                if options["enable_backward"]
+                else None
+            )
+            hooks = KernelHooks(forward, backward)
         else:
             func = ctypes.CFUNCTYPE(None)
             forward = (
@@ -4574,7 +4593,7 @@ class Module:
         if device is None:
             device = runtime.get_device()
 
-        return device.get_cuda_compile_arch()
+        return device.get_cuda_compile_arch() if device.is_cuda else None
 
     def _get_compile_output_name(
         self,
@@ -4597,6 +4616,11 @@ class Module:
         module directory and its CUDA caches.
         """
         module_name_short = self.get_module_identifier(block_dim=block_dim)
+
+        if device and device.is_sycl:
+            from warp._src.build_sycl import compiler_fingerprint, get_compiler  # noqa: PLC0415
+
+            return f"{module_name_short}.sycl{compiler_fingerprint(get_compiler())}.so"
 
         if device and device.is_cpu:
             resolved_flags = _resolve_cpu_compiler_flags(
@@ -4640,11 +4664,13 @@ class Module:
 
         return output_name
 
-    def _get_meta_name(self, block_dim: int | None = None) -> str:
+    def _get_meta_name(self, block_dim: int | None = None, device: Device | None = None) -> str:
         """Get the filename to use for the module metadata file.
 
         This is only the filename. It should be used to form a path.
         """
+        if device is not None and device.is_sycl:
+            return self._get_compile_output_name(device, block_dim=block_dim).removesuffix(".so") + ".meta"
         return f"{self.get_module_identifier(block_dim=block_dim)}.meta"
 
     @staticmethod
@@ -4661,7 +4687,7 @@ class Module:
             self.failed_builds[(device.context, active_block_dim)] = error
 
     @synchronized(_codegen_lock)
-    def _run_codegen(self, options: dict, is_cpu: bool) -> tuple[str, str, dict, list, list]:
+    def _run_codegen(self, options: dict, is_cpu: bool, is_sycl: bool = False) -> tuple[str, str, dict, list, list]:
         """Run the Python-side codegen window.
 
         Returns ``(source, ext, meta, ltoirs, fatbins)``: the emitted C++/CUDA
@@ -4674,18 +4700,48 @@ class Module:
         Clang invocation runs after this returns, so N modules still compile
         in parallel -- only the cheap codegen window serialises.
         """
+        if is_sycl:
+            if options["verify_fp"]:
+                raise NotImplementedError("Floating-point verification is not yet supported on SYCL")
+            if any(
+                options.get(key)
+                for key in (
+                    "extra_cpu_preamble",
+                    "extra_cuda_preamble",
+                    "extra_cpu_include_dirs",
+                    "extra_cuda_include_dirs",
+                )
+            ):
+                raise NotImplementedError("Custom module preambles and include paths are not yet supported on SYCL")
+            options = options | {"target_backend": "sycl"}
         builder = ModuleBuilder(
             self,
             options,
             hasher=self.hashers.get(options["block_dim"], None),
         )
-        if is_cpu:
+        if is_sycl:
+            # Include shared tile lifetimes and cooperative scratch for the portable
+            # reduction/scan paths. Summing across callees is conservative for nested calls.
+            shared_bytes = 16
+            for function in (*builder.kernels, *builder.functions):
+                shared_bytes += function.adj.get_total_required_shared_backward()
+                for var in function.adj.variables:
+                    if warp._src.types.is_tile(var.type):
+                        element_size = warp._src.types.type_size_in_bytes(var.type.dtype)
+                        shared_bytes += 2 * var.type.size_in_bytes()
+                        shared_bytes += warp._src.types.tile.round_up((element_size + 8) * options["block_dim"])
+            builder.options = builder.options | {"sycl_shared_bytes": shared_bytes}
+            ext = "sycl.cpp"
+            source = builder.codegen("sycl")
+        elif is_cpu:
             ext = "cpp"
             source = builder.codegen("cpu")
         else:
             ext = "cu"
             source = builder.codegen("cuda")
         meta = builder.build_meta()
+        if is_sycl:
+            meta["sycl_shared_bytes"] = shared_bytes
         ltoirs, fatbins = builder.get_link_inputs()
         return source, ext, meta, ltoirs, fatbins
 
@@ -4724,13 +4780,15 @@ class Module:
             output_arch = self._get_compile_arch(device)  # Will remain at None if device is CPU
 
         # output_arch is None for CPU targets, set to a SM architecture for CUDA
-        is_cpu = output_arch is None
+        is_sycl = device is not None and device.is_sycl
+        is_cpu = output_arch is None and not is_sycl
+        is_cuda = not is_cpu and not is_sycl
 
         options = options | {"output_arch": output_arch}
 
         # Reject cluster_dim > 1 when the compile target drops the cluster
         # attribute (status == "dropped"); see _cluster_dim_target_status.
-        if not is_cpu and output_arch < 90:
+        if is_cuda and output_arch < 90:
             device_arch = device.arch if device is not None else None
             if _cluster_dim_target_status(device_arch, output_arch) == "dropped":
                 # Validate the same live unique-kernel set that codegen emits.
@@ -4759,7 +4817,7 @@ class Module:
         active_block_dim = options["block_dim"]
 
         # Resolve the arch suffix once for both the output filename and the build call
-        if not is_cpu:
+        if is_cuda:
             init()
             arch_suffix = _validate_cuda_arch_suffix(
                 output_arch,
@@ -4789,7 +4847,7 @@ class Module:
             warp.config.cache_kernels
             and not options.get("verify_autograd_array_access", False)
             and os.path.exists(os.path.join(output_dir, output_name))
-            and os.path.exists(os.path.join(output_dir, self._get_meta_name(block_dim=active_block_dim)))
+            and os.path.exists(os.path.join(output_dir, self._get_meta_name(block_dim=active_block_dim, device=device)))
         ):
             return False
 
@@ -4804,12 +4862,12 @@ class Module:
         # failing kernel and continuing would leave the module claiming
         # kernels its binary does not contain.
         try:
-            source_str, source_code_ext, meta, ltoir_values, fatbin_values = self._run_codegen(options, is_cpu)
+            source_str, source_code_ext, meta, ltoir_values, fatbin_values = self._run_codegen(options, is_cpu, is_sycl)
         except Exception as e:
             self._record_build_failure(device, is_cpu, active_block_dim, e)
             raise
 
-        meta_path = os.path.join(output_dir, self._get_meta_name(block_dim=active_block_dim))
+        meta_path = os.path.join(output_dir, self._get_meta_name(block_dim=active_block_dim, device=device))
 
         build_dir = os.path.normpath(output_dir) + f"_p{os.getpid()}_t{threading.get_ident()}"
 
@@ -4822,12 +4880,12 @@ class Module:
             # Default to O2 for CPU, O3 for CUDA
             opt = 2 if is_cpu else 3
 
-        if opt != 3 and not is_cpu and runtime.toolkit_version is not None and runtime.toolkit_version < (12, 9):
+        if opt != 3 and is_cuda and runtime.toolkit_version is not None and runtime.toolkit_version < (12, 9):
             log_warning("Optimization level other than 3 has no effect on CUDA versions prior to 12.9.", once=True)
 
         if (
             opt == 0
-            and not is_cpu
+            and is_cuda
             and not options["llvm_cuda"]
             and runtime.toolkit_version is not None
             and runtime.toolkit_version >= (13, 1)
@@ -4854,7 +4912,11 @@ class Module:
         output_path = os.path.join(build_dir, output_name)
 
         try:
-            if is_cpu:
+            if is_sycl:
+                from warp._src.build_sycl import build_module  # noqa: PLC0415
+
+                build_module(output_path, source_code_path, options)
+            elif is_cpu:
                 # build object code
                 with warp.ScopedTimer("Compile x86", active=warp.config.log_level <= warp.LOG_DEBUG):
                     warp._src.build.build_cpu(
@@ -4918,7 +4980,7 @@ class Module:
         # ------------------------------------------------------------
         # write meta data (already produced by ``_run_codegen`` above)
 
-        output_meta_path = os.path.join(build_dir, self._get_meta_name(block_dim=active_block_dim))
+        output_meta_path = os.path.join(build_dir, self._get_meta_name(block_dim=active_block_dim, device=device))
 
         self._write_meta(output_meta_path, meta)
 
@@ -5049,7 +5111,7 @@ class Module:
                 output_arch = self._get_compile_arch(device)
 
                 module_dir = os.path.join(warp.config.kernel_cache_dir, module_name_short)
-                meta_path = os.path.join(module_dir, self._get_meta_name(block_dim=active_block_dim))
+                meta_path = os.path.join(module_dir, self._get_meta_name(block_dim=active_block_dim, device=device))
                 binary_path = os.path.join(module_dir, output_name)
 
                 try:
@@ -5071,7 +5133,30 @@ class Module:
             else:
                 raise FileNotFoundError(f"Module metadata file {meta_path} was not found in the cache")
 
-            if device.is_cpu:
+            if device.is_sycl:
+                from warp._src.sycl import check  # noqa: PLC0415
+
+                requested = meta["sycl_shared_bytes"] + 4 * active_block_dim
+                if requested > device.max_shared_memory_per_block:
+                    raise RuntimeError(
+                        f"SYCL module requires {requested} bytes of local memory, "
+                        f"but {device} supports {device.max_shared_memory_per_block}"
+                    )
+                module_handle = runtime.sycl.wp_sycl_load_module(os.fsencode(binary_path))
+                if module_handle is None:
+                    check(runtime.sycl, -1)
+                module_exec = ModuleExec(
+                    module_handle,
+                    module_hash,
+                    device,
+                    meta,
+                    active_block_dim,
+                    output_arch,
+                    det_launch_meta_map,
+                    self.hashers[active_block_dim].kernel_hashes,
+                )
+                self.execs[(device.context, active_block_dim)] = module_exec
+            elif device.is_cpu:
                 # LLVM modules are identified using strings, so we need to ensure uniqueness
                 id = self.increment_id()
                 module_handle = f"wp_{self.name}_{id}"
@@ -5811,17 +5896,18 @@ class Device:
             ``domain``, ``bus``, and ``device`` are all hexadecimal values. ``None`` for CPU devices.
     """
 
-    def __init__(self, runtime, alias, ordinal=-1, is_primary=False, context=None):
+    def __init__(self, runtime, alias, ordinal=-1, is_primary=False, context=None, backend=None):
         self.runtime = runtime
         self.alias = alias
         self.ordinal = ordinal
+        self.backend = backend or ("cpu" if ordinal == -1 else "cuda")
         self.is_primary = is_primary
 
         # context can be None to avoid acquiring primary contexts until the device is used
         self._context = context
 
         # if the device context is not primary, it cannot be None
-        if ordinal != -1 and not is_primary:
+        if self.is_cuda and not is_primary:
             if context is None:
                 raise RuntimeError(
                     f"A non-primary CUDA device requires a valid context, got context=None for device ordinal {ordinal}"
@@ -5836,7 +5922,7 @@ class Device:
 
         self.context_guard = ContextGuard(self)
 
-        if self.ordinal == -1:
+        if self.is_cpu:
             # CPU device
             self.name = platform.processor() or "CPU"
             self.arch = 0
@@ -5862,6 +5948,34 @@ class Device:
             self.default_allocator = CpuDefaultAllocator(self)
             self.pinned_allocator = CpuPinnedAllocator(self)
 
+        elif self.is_sycl:
+            from warp._src.sycl import SyclAllocator, check  # noqa: PLC0415
+
+            library = runtime.sycl
+            self.name = library.wp_sycl_device_name(context).decode("utf-8")
+            self.arch = 0
+            self.sm_count = 0
+            self.max_shared_memory_per_block = library.wp_sycl_device_local_memory_size(context)
+            self.max_work_group_size = library.wp_sycl_device_max_work_group_size(context)
+            self.supports_fp64 = bool(library.wp_sycl_device_has_fp64(context))
+            self.supports_atomic64 = bool(library.wp_sycl_device_has_atomic64(context))
+            self.is_uva = False
+            self.is_cpu_memory_access_from_gpu_supported = False
+            self.is_gpu_memory_access_from_cpu_supported = False
+            self.is_cpu_gpu_atomic_supported = False
+            self.is_managed_memory_supported = False
+            self.is_concurrent_managed_access_supported = False
+            self.is_mempool_supported = False
+            self.is_mempool_enabled = False
+            self.is_ipc_supported = False
+            self.is_cubin_supported = False
+            self.uuid = None
+            self.pci_bus_id = None
+            self.default_allocator = SyclAllocator(self)
+            self.memset = lambda ptr, value, size: check(library, library.wp_sycl_memset(context, ptr, value, size))
+            self.memtile = lambda ptr, src, size, count: check(
+                library, library.wp_sycl_memtile(context, ptr, src, size, count)
+            )
         elif ordinal >= 0 and ordinal < runtime.core.wp_cuda_device_get_count():
             # CUDA device
             self.name = runtime.core.wp_cuda_device_get_name(ordinal).decode()
@@ -5954,7 +6068,7 @@ class Device:
                 return self._custom_allocator
             return self.current_allocator
         else:
-            if pinned:
+            if pinned and self.is_cpu:
                 return self.pinned_allocator
             else:
                 return self.default_allocator
@@ -5970,12 +6084,17 @@ class Device:
     @property
     def is_cpu(self) -> bool:
         """A boolean indicating whether the device is a CPU device."""
-        return self.ordinal < 0
+        return self.backend == "cpu"
 
     @property
     def is_cuda(self) -> bool:
         """A boolean indicating whether the device is a CUDA device."""
-        return self.ordinal >= 0
+        return self.backend == "cuda"
+
+    @property
+    def is_sycl(self) -> bool:
+        """A boolean indicating whether the device is an Intel SYCL device."""
+        return self.backend == "sycl"
 
     @property
     def is_capturing(self) -> bool:
@@ -5984,6 +6103,8 @@ class Device:
         For CUDA devices this reflects CUDA stream capture; for the CPU device it reflects
         an active CPU graph capture (which uses APIC recording, not a CUDA stream).
         """
+        if self.is_sycl:
+            return bool(self.captures)
         if self.is_cuda and self.stream is not None:
             # There is no CUDA API to check if graph capture was started on a device, so we
             # can't tell if a capture was started by external code on a different stream.
@@ -6028,7 +6149,7 @@ class Device:
         Raises:
             RuntimeError: The device is not a CUDA device.
         """
-        if self.context:
+        if self.is_cuda and self.context:
             return self._stream
         else:
             raise RuntimeError(f"Device {self} is not a CUDA device")
@@ -6137,7 +6258,7 @@ class Device:
             return False
 
     def make_current(self):
-        if self.context is not None:
+        if self.is_cuda and self.context is not None:
             self.runtime.core.wp_cuda_context_set_current(self.context)
 
     def can_access(self, other):
@@ -6374,6 +6495,7 @@ class Graph:
         self.capture_id = capture_id
         self.module_execs: set[ModuleExec] = set()
         self._deterministic_buffer_refs: list[Any] = []
+        self._sycl_refs: list[Any] = []
         self.graph_exec: ctypes.c_void_p | None = None
         self.graph: ctypes.c_void_p | None = None
 
@@ -6424,6 +6546,11 @@ class Graph:
 
         try:
             # use CUDA context guard to avoid side effects during garbage collection
+            if self.device.is_sycl:
+                from warp._src.sycl import check  # noqa: PLC0415
+
+                check(runtime.sycl, runtime.sycl.wp_sycl_graph_destroy(self.device.context, self.graph))
+                return
             with self.device.context_guard:
                 runtime.core.wp_cuda_graph_destroy(self.device.context, self.graph)
                 if hasattr(self, "graph_exec") and self.graph_exec is not None:
@@ -8534,6 +8661,25 @@ class Runtime:
         # initialize kernel cache
         warp._src.build.init_kernel_cache(warp.config.kernel_cache_dir)
 
+        self.sycl = None
+        self.sycl_devices = []
+        sycl_lib = os.path.join(bin_path, "warp-sycl.so")
+        if sys.platform == "linux" and os.path.isfile(sycl_lib):
+            from warp._src.sycl import check, register_functions  # noqa: PLC0415
+
+            self.sycl = self.load_dll(sycl_lib)
+            register_functions(self.sycl)
+            _verify_library_version(self.sycl, "warp-sycl", "wp_sycl_version", warp.config.version)
+            check(self.sycl, self.sycl.wp_sycl_init())
+            for ordinal in range(self.sycl.wp_sycl_device_count()):
+                context = self.sycl.wp_sycl_device_get(ordinal)
+                device = Device(self, f"sycl:{ordinal}", ordinal=ordinal, context=context, backend="sycl")
+                self.sycl_devices.append(device)
+                self.device_map[device.alias] = device
+                self.context_map[context] = device
+            if self.sycl_devices:
+                self.device_map["sycl"] = self.sycl_devices[0]
+
         # global tape
         self.tape = None
 
@@ -8578,6 +8724,8 @@ class Runtime:
             alias_str = f'"{self.cpu_device.alias}"'
             name_str = f'"{self.cpu_device.name}"'
             greeting.append(f"     {alias_str:10s} : {name_str}")
+            for sycl_device in self.sycl_devices:
+                greeting.append(f'     "{sycl_device.alias}"   : "{sycl_device.name}" (SYCL)')
             for cuda_device in self.cuda_devices:
                 alias_str = f'"{cuda_device.alias}"'
                 if cuda_device.is_primary:
@@ -9052,6 +9200,7 @@ def get_devices() -> list[Device]:
         devices.append(runtime.cpu_device)
     for cuda_device in runtime.cuda_devices:
         devices.append(cuda_device)
+    devices.extend(runtime.sycl_devices)
     return devices
 
 
@@ -10631,12 +10780,16 @@ def pack_arg(kernel, arg_type, arg_name, value, device, adjoint=False):
     device = runtime.get_device(device)
 
     if warp._src.types.is_array(arg_type):
+        if device.is_sycl and not warp._src.types.matches_array_class(arg_type, warp.array):
+            raise NotImplementedError("SYCL kernels currently require regular Warp arrays")
         if value is None:
             # allow for NULL arrays
             return arg_type.__ctype__()
 
         elif isinstance(value, warp._src.types.array_t):
             # accept array descriptors verbatim
+            if device.is_sycl:
+                raise NotImplementedError("Raw array descriptors are not supported for SYCL launches")
             return value
 
         else:
@@ -10661,7 +10814,7 @@ def pack_arg(kernel, arg_type, arg_name, value, device, adjoint=False):
                             return warp._src.types.array_ctype_from_interface(
                                 interface, dtype=arg_type.dtype, owner=value
                             )
-                    else:
+                    elif device.is_cpu:
                         # check for __array_interface__
                         try:
                             interface = value.__array_interface__
@@ -10702,6 +10855,8 @@ def pack_arg(kernel, arg_type, arg_name, value, device, adjoint=False):
 
             # Optional diagnostic check for mixed-device launches. By default, array pointers are passed
             # through and the hardware access rules determine whether the launch is valid.
+            if (device.is_sycl or value.device.is_sycl) and value.device != device:
+                raise RuntimeError(f"SYCL kernel argument '{arg_name}' must reside on the launch device")
             if warp.config.launch_array_access_mode != warp.config.LaunchArrayAccessMode.RELAXED:
                 _validate_launch_array_access(kernel, arg_name, value, device)
 
@@ -10749,6 +10904,13 @@ def pack_arg(kernel, arg_type, arg_name, value, device, adjoint=False):
             raise RuntimeError(
                 f"Error launching kernel '{kernel.key}', argument '{arg_name}' expects {arg_type.key} but got None"
             )
+        for name, var in arg_type.vars.items():
+            member = getattr(value, name)
+            if isinstance(var.type, warp._src.codegen.Struct) or (
+                warp._src.types.is_array(var.type)
+                and (device.is_sycl or (member is not None and member.device.is_sycl))
+            ):
+                pack_arg(kernel, var.type, f"{arg_name}.{name}", member, device, adjoint)
         return value.__ctype__()
 
     # try to convert to a value type (vec3, mat33, etc)
@@ -11714,7 +11876,7 @@ def launch(
         if not module_exec:
             return
 
-        if not kernel.grid_stride and not device.is_cpu:
+        if not kernel.grid_stride and device.is_cuda:
             if max_blocks > 0:
                 raise RuntimeError(
                     f"Kernel '{kernel.key}' was launched with max_blocks={max_blocks}, but it was compiled "
@@ -11808,6 +11970,20 @@ def launch(
             )
 
         # run kernel
+        elif device.is_sycl:
+            if stream is not None:
+                raise NotImplementedError("SYCL launches do not support CUDA streams")
+            if max_blocks:
+                raise NotImplementedError("SYCL launches do not yet support max_blocks")
+            if block_dim > device.max_work_group_size:
+                raise ValueError(f"block_dim={block_dim} exceeds the SYCL device work-group limit")
+            if record_cmd:
+                raise NotImplementedError("Recorded SYCL launches are not yet supported")
+            if device.is_capturing:
+                graph = device.captures[None]
+                graph._retain_module_exec(module_exec)
+                graph._sycl_refs.extend((*fwd_args, *adj_args))
+            invoke(kernel, hooks, params, adjoint)
         elif device.is_cpu:
             if adjoint:
                 if hooks.backward is None:
@@ -12320,6 +12496,9 @@ def synchronize():
     or memory copies have completed.
     """
 
+    for device in runtime.sycl_devices:
+        synchronize_device(device)
+
     if is_cuda_driver_initialized():
         # save the original context to avoid side effects
         saved_context = runtime.core.wp_cuda_context_get_current()
@@ -12348,7 +12527,11 @@ def synchronize_device(device: DeviceLike = None):
     """
 
     device = runtime.get_device(device)
-    if device.is_cuda:
+    if device.is_sycl:
+        from warp._src.sycl import check  # noqa: PLC0415
+
+        check(runtime.sycl, runtime.sycl.wp_sycl_synchronize(device.context))
+    elif device.is_cuda:
         if device.is_capturing:
             raise RuntimeError(f"Cannot synchronize device {device} while graph capture is active")
 
@@ -13174,6 +13357,22 @@ def capture_begin(
         raise RuntimeError("Graph capture already in progress")
 
     # ---- CPU capture path ----
+    if device.is_sycl:
+        from warp._src.sycl import check  # noqa: PLC0415
+
+        if stream is not None or external or apic:
+            raise NotImplementedError("SYCL capture does not support CUDA streams, external capture, or APIC")
+        if device.is_capturing:
+            raise RuntimeError("Graph capture already in progress on this SYCL device")
+        if force_module_load:
+            force_load(device)
+        graph = Graph(device)
+        graph.graph = runtime.sycl.wp_sycl_graph_begin(device.context)
+        if graph.graph is None:
+            check(runtime.sycl, -1)
+        device.captures[None] = graph
+        return
+
     if device.is_cpu:
         from warp._src.apic.capture import APICapture  # noqa: PLC0415
 
@@ -13284,6 +13483,14 @@ def capture_end(device: DeviceLike = None, stream: Stream | None = None) -> Grap
         device = stream.device
     else:
         device = runtime.get_device(device)
+        if device.is_sycl:
+            from warp._src.sycl import check  # noqa: PLC0415
+
+            graph = device.captures.pop(None, None)
+            if graph is None:
+                raise RuntimeError("Graph capture is not active on this SYCL device")
+            check(runtime.sycl, runtime.sycl.wp_sycl_graph_end(device.context, graph.graph))
+            return graph
         if not device.is_cuda:
             raise RuntimeError("Must be a CUDA device")
         stream = device.stream
@@ -13325,6 +13532,8 @@ def capture_debug_dot_print(graph: Graph, path: str, verbose: bool = True):
         path: Path to save the DOT file
         verbose: Whether to include additional debug information in the output
     """
+    if graph.device.is_sycl:
+        raise NotImplementedError("SYCL graph DOT export is not yet supported")
     if not runtime.core.wp_capture_debug_dot_print(graph.graph, path.encode(), 1 if verbose else 0):
         raise RuntimeError(f"Graph debug dot print error: {runtime.get_error_string()}")
 
@@ -13423,6 +13632,8 @@ def capture_resume(
     *,
     _resume_apic_recording: bool = True,
 ):
+    if graph is not None and graph.device.is_sycl:
+        raise NotImplementedError("Pausing and resuming SYCL graph capture is not yet supported")
     # ---- CPU APIC capture path ---- (mirror of capture_pause)
     if graph is not None and graph.device.is_cpu and graph._apic_capture is not None:
         # After capture_end() the graph keeps _apic_capture for replay, so guard
@@ -13570,6 +13781,9 @@ def capture_if(
         raise TypeError("Condition must be a Warp array of int32 with a single element")
 
     device = condition.device
+
+    if device.is_sycl:
+        raise NotImplementedError("SYCL conditional graphs are not yet supported")
 
     # determine the stream and whether a graph capture is active
     if device.is_cuda:
@@ -13798,6 +14012,9 @@ def capture_while(condition: warp.array[int], while_body: Callable | Graph, stre
 
     device = condition.device
 
+    if device.is_sycl:
+        raise NotImplementedError("SYCL conditional graphs are not yet supported")
+
     # determine the stream and whether a graph capture is active
     if device.is_cuda:
         if stream is None:
@@ -13978,6 +14195,14 @@ def capture_launch(graph: Graph, stream: Stream | None = None):
           :func:`~warp.capture_load()`.
         stream: A :class:`Stream` to launch the graph on (CUDA only)
     """
+
+    if graph.device.is_sycl:
+        from warp._src.sycl import check  # noqa: PLC0415
+
+        if stream is not None:
+            raise NotImplementedError("SYCL graphs do not support CUDA streams")
+        check(runtime.sycl, runtime.sycl.wp_sycl_graph_launch(graph.device.context, graph.graph))
+        return
 
     # ---- APIC loaded graph path ----
     if graph._native_graph is not None:
@@ -14215,6 +14440,9 @@ def capture_load(path: str, device: DeviceLike = None) -> Graph:
     device = runtime.get_device(device)
     wrp_path = path if path.endswith(".wrp") else path + ".wrp"
 
+    if device.is_sycl:
+        raise NotImplementedError("SYCL graph serialization is not yet supported")
+
     device_type = 1 if device.is_cpu else 0
     context = device.context if device.is_cuda else None
 
@@ -14402,6 +14630,64 @@ def copy(
         return
 
     # figure out the stream for the copy
+    if src.device.is_sycl or dest.device.is_sycl:
+        from warp._src.sycl import check  # noqa: PLC0415
+
+        if stream is not None:
+            raise NotImplementedError("SYCL copies do not support CUDA streams")
+        if src.device.is_cuda or dest.device.is_cuda:
+            raise NotImplementedError("Copy between CUDA and SYCL requires an explicit CPU staging array")
+        if src.device.is_sycl and dest.device.is_sycl and src.device != dest.device:
+            raise NotImplementedError("Copy between SYCL devices requires an explicit CPU staging array")
+        if not isinstance(src, warp.array) or not isinstance(dest, warp.array):
+            raise NotImplementedError("SYCL copies currently require regular Warp arrays")
+        src_size = warp._src.types.type_size_in_bytes(src.dtype)
+        dest_size = warp._src.types.type_size_in_bytes(dest.dtype)
+        if src_size != dest_size:
+            raise RuntimeError("Copy source and destination must have the same element size")
+        if src_offset + count > src.size or dest_offset + count > dest.size:
+            raise RuntimeError("SYCL copy exceeds source or destination bounds")
+        device = src.device if src.device.is_sycl else dest.device
+        if device.is_capturing:
+            device.captures[None]._sycl_refs.extend((src, dest))
+        if not src.is_contiguous or not dest.is_contiguous:
+            if (src_offset or dest_offset or count != src.size) and (src.ndim != 1 or dest.ndim != 1):
+                raise RuntimeError("Partial non-contiguous SYCL copies require one-dimensional arrays")
+            if src.device != dest.device:
+                if not src.is_contiguous:
+                    src = src.contiguous()
+                if not dest.is_contiguous:
+                    staging = empty(shape=dest.shape, dtype=dest.dtype, device=dest.device)
+                    copy(staging, src, dest_offset, src_offset, count)
+                    copy(dest, staging, dest_offset, dest_offset, count)
+                    return
+                copy(dest, src, dest_offset, src_offset, count)
+                return
+            check(
+                runtime.sycl,
+                runtime.sycl.wp_sycl_array_copy(
+                    device.context,
+                    ctypes.byref(dest.__ctype__()),
+                    ctypes.byref(src.__ctype__()),
+                    dest_offset,
+                    src_offset,
+                    count,
+                    src_size,
+                ),
+            )
+            return
+        check(
+            runtime.sycl,
+            runtime.sycl.wp_sycl_memcpy(
+                device.context,
+                dest.ptr + dest_offset * dest_size,
+                src.ptr + src_offset * src_size,
+                count * src_size,
+                int(src.device.is_cpu or dest.device.is_cpu),
+            ),
+        )
+        return
+
     if stream is None:
         if dest.device.is_cuda:
             stream = dest.device.stream

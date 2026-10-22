@@ -116,6 +116,8 @@ def array_scan(in_array: wp.array, out_array: wp.array, inclusive: bool = True) 
         apic_capture.track_array(in_array)
         apic_capture.track_array(out_array)
 
+    if in_array.device.is_sycl:
+        raise NotImplementedError("array_scan() is not yet supported on SYCL; use a tiled kernel")
     if in_array.device.is_cpu:
         if scalar_type == wp.int32:
             native_func = runtime.core.wp_array_scan_int_host
@@ -223,6 +225,8 @@ def radix_sort_pairs(
         apic_capture.track_array(keys)
         apic_capture.track_array(values)
 
+    if keys.device.is_sycl:
+        raise NotImplementedError("radix_sort_pairs() is not yet supported on SYCL")
     if keys.device.is_cpu:
         if keys.dtype == wp.int32:
             runtime.core.wp_radix_sort_pairs_int_host(keys.ptr, values.ptr, count, begin_bit, end_bit, value_size)
@@ -411,6 +415,8 @@ def segmented_sort_pairs(
         apic_capture.track_array(segment_start_indices)
         apic_capture.track_array(segment_end_indices)
 
+    if keys.device.is_sycl:
+        raise NotImplementedError("segmented_sort_pairs() is not yet supported on SYCL")
     if keys.device.is_cpu:
         if keys.dtype == wp.int32 and values.dtype == wp.int32:
             success = runtime.core.wp_segmented_sort_pairs_int_host(
@@ -546,6 +552,8 @@ def runlength_encode(
         apic_capture.track_array(run_lengths)
         apic_capture.track_array(run_count)
 
+    if values.device.is_sycl:
+        raise NotImplementedError("runlength_encode() is not yet supported on SYCL")
     if values.device.is_cpu:
         if values.dtype == wp.int32:
             runtime.core.wp_runlength_encode_int_host(
@@ -715,6 +723,8 @@ def array_sum(
             return out.numpy()[0]
         return out
 
+    if values.device.is_sycl:
+        raise NotImplementedError("array_sum() is not yet supported on SYCL; use a tiled kernel")
     if values.device.is_cpu:
         if scalar_type == wp.float32:
             native_func = context.runtime.core.wp_array_sum_float_host
@@ -863,6 +873,8 @@ def array_inner(
         out.zero_()
         return out
 
+    if a.device.is_sycl:
+        raise NotImplementedError("array_inner() is not yet supported on SYCL; use a tiled kernel")
     if a.device.is_cpu:
         if scalar_type == wp.float32:
             native_func = context.runtime.core.wp_array_inner_float_host
