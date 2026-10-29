@@ -3,7 +3,11 @@
 
 import ctypes
 
-from warp._src.types import array_t
+from warp._src.types import array_t, float32, float64, int32, int64, uint32, uint64
+
+# Type codes shared with warp/native/warp_sycl.cpp (scan) and warp/native/sort_sycl.cpp (sort).
+SCAN_TYPES = {int32: 0, int64: 1, float32: 2, float64: 3}
+SORT_KEY_TYPES = {int32: 0, uint32: 1, float32: 2, int64: 3, uint64: 4, float64: 5}
 
 
 def register_functions(library) -> None:
@@ -22,6 +26,9 @@ def register_functions(library) -> None:
         "device_name": (string, [ptr]),
         "device_max_work_group_size": (size, [ptr]),
         "device_local_memory_size": (size, [ptr]),
+        "device_compute_units": (integer, [ptr]),
+        "device_resident_threads": (size, [ptr]),
+        "device_memory_info": (integer, [ptr, ctypes.POINTER(size), ctypes.POINTER(size)]),
         "device_has_fp64": (integer, [ptr]),
         "device_has_atomic64": (integer, [ptr]),
         "alloc": (ptr, [ptr, size]),
@@ -29,17 +36,37 @@ def register_functions(library) -> None:
         "memcpy": (integer, [ptr, ptr, ptr, size, integer]),
         "memset": (integer, [ptr, ptr, integer, size]),
         "memtile": (integer, [ptr, ptr, ptr, size, size]),
+        "stage_args": (ptr, [ptr, ptr, size]),
+        "stream_create": (ptr, [ptr]),
+        "stream_default": (ptr, [ptr]),
+        "stream_current": (ptr, [ptr]),
+        "stream_destroy": (integer, [ptr, ptr]),
+        "stream_set_current": (integer, [ptr, ptr, integer]),
+        "stream_synchronize": (integer, [ptr, ptr]),
+        "stream_query": (integer, [ptr]),
+        "stream_wait_event": (integer, [ptr, ptr, ptr, integer]),
+        "event_create": (ptr, [ptr, integer]),
+        "event_destroy": (None, [ptr]),
+        "event_record": (integer, [ptr, ptr, ptr, integer]),
+        "event_synchronize": (integer, [ptr]),
+        "event_query": (integer, [ptr]),
+        "event_elapsed_time": (integer, [ptr, ptr, ctypes.POINTER(ctypes.c_float)]),
         "synchronize": (integer, [ptr]),
         "load_module": (ptr, [string]),
         "get_kernel": (ptr, [ptr, string]),
         "unload_module": (integer, [ptr, ptr]),
         "graph_supported": (integer, [ptr]),
+        "graph_event_supported": (integer, [ptr]),
         "graph_begin": (ptr, [ptr]),
         "graph_end": (integer, [ptr, ptr]),
         "graph_launch": (integer, [ptr, ptr]),
         "graph_destroy": (integer, [ptr, ptr]),
+        "graph_memory_info": (integer, [ptr, ctypes.POINTER(size), ctypes.POINTER(size)]),
         "array_copy": (integer, [ptr, ptr, ptr, size, size, size, size]),
         "array_fill": (integer, [ptr, ptr, ptr, size, size]),
+        "array_scan": (integer, [ptr, integer, ptr, ptr, integer, integer, integer, integer, integer]),
+        "radix_sort_pairs": (integer, [ptr, integer, ptr, ptr, integer, integer, integer, integer]),
+        "segmented_sort_pairs": (integer, [ptr, integer, ptr, ptr, integer, ptr, ptr, integer]),
         "bvh_create": (identifier, [ptr, ptr, ptr, integer, integer, ptr, integer]),
         "bvh_destroy": (integer, [identifier]),
         "bvh_refit": (integer, [identifier]),
@@ -61,6 +88,11 @@ def check(library, result: int) -> None:
         raise RuntimeError(f"Warp SYCL error: {library.wp_sycl_get_error_string().decode('utf-8')}")
 
 
+def retain_arrays(device, *arrays) -> None:
+    if device.is_capturing:
+        device.captures[None]._sycl_refs.extend(array for array in arrays if array is not None)
+
+
 class SyclAllocator:
     deallocate_requires_context_guard = False
 
@@ -68,8 +100,6 @@ class SyclAllocator:
         self.device = device
 
     def allocate(self, size_in_bytes):
-        if self.device.is_capturing:
-            raise NotImplementedError("Allocations during SYCL graph capture are not supported")
         library = self.device.runtime.sycl
         ptr = library.wp_sycl_alloc(self.device.context, size_in_bytes)
         if ptr is None:

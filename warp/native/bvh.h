@@ -756,6 +756,18 @@ void cubql_bvh_rebuild_device(BVH& bvh);
 
 #endif  // WP_ENABLE_CUDA
 
+#if defined(SYCL_LANGUAGE_VERSION)
+
+struct SyclSharedStorage;
+
+// SYCL BVHs are built on the host and copied to shared USM, see bvh_sycl.cpp.
+void bvh_check_constructor_sycl(int constructor_type);
+BVH copy_host_tree_to_sycl(SyclSharedStorage& storage, const BVH& bvh_host);
+void bvh_update_sycl(BVH& bvh_sycl, const BVH& bvh_host);
+void bvh_refit_sycl(void* device, BVH bvh);
+
+#endif  // SYCL_LANGUAGE_VERSION
+
 }  // namespace wp
 
 

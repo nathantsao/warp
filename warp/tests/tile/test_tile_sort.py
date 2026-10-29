@@ -42,7 +42,7 @@ def test_tile_sort_keys_and_values_across_dtypes_and_sizes(test, device):
     """Sort key-value pairs across supported data types, lengths, and block dimensions."""
     # Forward-declare kernels for more efficient compilation
     kernels = {}
-    for dtype in [wp.int32, wp.int64, wp.uint64, wp.float32]:
+    for dtype in [wp.int32, wp.uint32, wp.int64, wp.uint64, wp.float32]:
         # Limit 64-bit types to 2^10 elements to avoid running out of shared memory
         max_power = 10 if dtype in [wp.int64, wp.uint64] else 11
         for i in range(0, max_power):
@@ -58,6 +58,8 @@ def test_tile_sort_keys_and_values_across_dtypes_and_sizes(test, device):
             if dtype == wp.int32:
                 # Generate integers in range [-500000000, 500000000)
                 np_keys = rng.integers(-500000000, 500000000, size=length, dtype=np.int32)
+            elif dtype == wp.uint32:
+                np_keys = rng.integers(0, 1000000000, size=length, dtype=np.uint32)
             elif dtype == wp.int64:
                 # Generate integers in range [-500000000000, 500000000000)
                 np_keys = rng.integers(-500000000000, 500000000000, size=length, dtype=np.int64)
@@ -110,6 +112,91 @@ def test_tile_sort_keys_and_values_across_dtypes_and_sizes(test, device):
                 np_sorted_values,
                 err_msg=f"Value sorting mismatch for {context}",
             )
+
+
+def test_tile_sort_key_value_permutation(test, device):
+    """Preserve every pair without requiring stable ordering of duplicate keys."""
+    lengths = (1, 31, 32, 33, 63, 64, 65, 2048, 2049)
+    kernels = {length: create_sort_kernel(wp.int32, length) for length in lengths}
+    rng = np.random.default_rng(719)
+    for length, kernel in kernels.items():
+        random_keys = rng.integers(-7, 8, size=length, dtype=np.int32)
+        for np_keys in (random_keys, np.sort(random_keys), np.sort(random_keys)[::-1].copy()):
+            np_values = np.arange(length, dtype=np.int32)
+            input_keys = wp.array(np_keys, device=device)
+            input_values = wp.array(np_values, device=device)
+            output_keys = wp.empty_like(input_keys)
+            output_values = wp.empty_like(input_values)
+            for block_dim in (32, 128):
+                with test.subTest(length=length, block_dim=block_dim):
+                    wp.launch_tiled(
+                        kernel,
+                        dim=1,
+                        inputs=[input_keys, input_values, output_keys, output_values],
+                        block_dim=block_dim,
+                        device=device,
+                    )
+                    keys, values = output_keys.numpy(), output_values.numpy()
+                    np.testing.assert_array_equal(keys, np.sort(np_keys))
+                    np.testing.assert_array_equal(np.sort(values), np_values)
+                    np.testing.assert_array_equal(keys, np_keys[values])
+
+
+@wp.struct
+class TileSortPayload:
+    index: wp.int32
+    value: wp.vec3
+
+
+def create_payload_sort_kernel(VALUE_TYPE, MAX_SORT_LENGTH):
+    @wp.kernel(enable_backward=False, module="unique")
+    def tile_sort_payload_kernel(
+        input_keys: wp.array[wp.int32],
+        input_values: wp.array[VALUE_TYPE],
+        output_keys: wp.array[wp.int32],
+        output_values: wp.array[VALUE_TYPE],
+    ):
+        keys = wp.tile_load(input_keys, shape=MAX_SORT_LENGTH)
+        values = wp.tile_load(input_values, shape=MAX_SORT_LENGTH)
+        wp.tile_sort(keys, values)
+        wp.tile_store(output_keys, keys)
+        wp.tile_store(output_values, values)
+
+    return tile_sort_payload_kernel
+
+
+def test_tile_sort_payloads(test, device):
+    """Move scalar, vector, matrix, and struct payloads without changing their contents."""
+    for length in (32, 33):
+        np_keys = np.random.default_rng(length).permutation(length).astype(np.int32)
+        indices = np.arange(length, dtype=np.int32)
+        vector_values = np.stack((indices, indices + 0.25, 1 - indices), axis=1).astype(np.float32)
+        struct_values = np.zeros(length, dtype=TileSortPayload.numpy_dtype())
+        struct_values["index"] = indices
+        struct_values["value"] = vector_values
+        payloads = (
+            (wp.float16, indices.astype(np.float32)),
+            (wp.uint64, indices.astype(np.uint64) + np.uint64(1 << 40)),
+            (wp.vec3, vector_values),
+            (wp.mat22, np.arange(length * 4, dtype=np.float32).reshape(length, 2, 2)),
+            (TileSortPayload, struct_values),
+        )
+        for dtype, np_values in payloads:
+            with test.subTest(length=length, dtype=dtype):
+                input_keys = wp.array(np_keys, device=device)
+                input_values = wp.array(np_values, dtype=dtype, device=device)
+                expected_values = input_values.numpy()[np.argsort(np_keys)]
+                output_keys = wp.empty_like(input_keys)
+                output_values = wp.empty_like(input_values)
+                wp.launch_tiled(
+                    create_payload_sort_kernel(dtype, length),
+                    dim=1,
+                    inputs=[input_keys, input_values, output_keys, output_values],
+                    block_dim=32,
+                    device=device,
+                )
+                np.testing.assert_array_equal(output_keys.numpy(), np.sort(np_keys))
+                np.testing.assert_array_equal(output_values.numpy(), expected_values)
 
 
 def _run_large_cpu_tile_sort():
@@ -303,6 +390,10 @@ add_function_test(
     devices=devices,
 )
 add_function_test(TestTileSort, "test_tile_sort_bfloat16_payload", test_tile_sort_bfloat16_payload, devices=devices)
+add_function_test(
+    TestTileSort, "test_tile_sort_key_value_permutation", test_tile_sort_key_value_permutation, devices=devices
+)
+add_function_test(TestTileSort, "test_tile_sort_payloads", test_tile_sort_payloads, devices=devices)
 add_function_test(
     TestTileSort,
     "test_tile_sort_heap_backed_cpu",

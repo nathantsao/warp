@@ -4,11 +4,14 @@
 import builtins
 import ctypes
 import errno
+import functools
 import hashlib
 import json
 import ntpath
 import os
 import shutil
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -198,6 +201,78 @@ def build_cpu(
     )
     if err != 0:
         raise Exception(f"CPU kernel build failed with error code {err}")
+
+
+def get_sycl_compiler() -> str:
+    """Find the Intel oneAPI compiler in the configured Linux environment."""
+    if sys.platform != "linux":
+        raise RuntimeError("Warp SYCL support requires Linux")
+    compiler = shutil.which(os.environ.get("WARP_SYCL_COMPILER", "icpx"))
+    if compiler is None:
+        raise RuntimeError("SYCL compiler not found; source oneAPI setvars.sh or set WARP_SYCL_COMPILER")
+    return compiler
+
+
+def run_sycl_compiler(command: list[str]) -> str:
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode:
+        raise RuntimeError(f"SYCL compilation failed:\n{' '.join(command)}\n{result.stdout}\n{result.stderr}")
+    return result.stdout
+
+
+@functools.cache
+def sycl_compiler_fingerprint(compiler: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(os.path.realpath(compiler).encode())
+    digest.update(run_sycl_compiler([compiler, "--version"]).encode())
+    native = Path(__file__).resolve().parents[1] / "native"
+    for header in sorted(native.glob("*.h")):
+        digest.update(header.name.encode())
+        digest.update(header.read_bytes())
+    runtime = native.parent / "bin" / "warp-sycl.so"
+    digest.update(runtime.read_bytes())
+    for name in ("codegen.py", "build.py", "build_dll.py", "context.py"):
+        digest.update((Path(__file__).parent / name).read_bytes())
+    return digest.hexdigest()[:16]
+
+
+def build_sycl(output: str, source: str, options: dict) -> None:
+    native = Path(__file__).resolve().parents[1] / "native"
+    optimization = options["optimization_level"]
+    if optimization is None:
+        optimization = 2 if options["mode"] == "release" else 0
+    command = [
+        get_sycl_compiler(),
+        "-fsycl",
+        "-std=c++17",
+        "-fPIC",
+        "-shared",
+        "-fvisibility=hidden",
+        "-DWP_BUILD_DLL",
+        f"-O{optimization}",
+        "-I",
+        str(native),
+        source,
+        "-L",
+        str(native.parent / "bin"),
+        "-l:warp-sycl.so",
+        f"-Wl,-rpath,{native.parent / 'bin'}",
+        "-o",
+        output,
+    ]
+    if options["mode"] == "debug":
+        command.append("-g")
+    else:
+        # Release kernels must not carry the debug-only tile bounds checks and device asserts.
+        command.append("-DNDEBUG")
+    if options["fast_math"]:
+        command.append("-ffast-math")
+    else:
+        # icpx defaults to a fast floating-point model with approximate sin/cos/tan, sqrt and division
+        command.extend(["-ffp-model=precise", "-foffload-fp32-prec-sqrt", "-foffload-fp32-prec-div"])
+    if not options["fuse_fp"]:
+        command.append("-ffp-contract=off")
+    run_sycl_compiler(command)
 
 
 def _add_long_path_prefix(path):

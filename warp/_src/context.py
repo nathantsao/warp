@@ -4618,9 +4618,9 @@ class Module:
         module_name_short = self.get_module_identifier(block_dim=block_dim)
 
         if device and device.is_sycl:
-            from warp._src.build_sycl import compiler_fingerprint, get_compiler  # noqa: PLC0415
-
-            return f"{module_name_short}.sycl{compiler_fingerprint(get_compiler())}.so"
+            compiler = warp._src.build.get_sycl_compiler()
+            fingerprint = warp._src.build.sycl_compiler_fingerprint(compiler)
+            return f"{module_name_short}.sycl{fingerprint}.so"
 
         if device and device.is_cpu:
             resolved_flags = _resolve_cpu_compiler_flags(
@@ -4720,17 +4720,32 @@ class Module:
             hasher=self.hashers.get(options["block_dim"], None),
         )
         if is_sycl:
-            # Include shared tile lifetimes and cooperative scratch for the portable
-            # reduction/scan paths. Summing across callees is conservative for nested calls.
+            # Shared tiles follow a stack discipline, so the requirement of the module is the deepest
+            # kernel (callee frames included) plus the largest transient scratch of any tile operation
+            # (portable reduction/scan/sort buffers and the scalar Cholesky workspace), which is allocated
+            # and released within a single operation.
             shared_bytes = 16
+            frames = 0
+            scratch = 0
+            for kernel in builder.kernels:
+                frames = max(frames, kernel.adj.get_total_required_shared())
+                if (options | kernel.options)["enable_backward"]:
+                    frames = max(frames, kernel.adj.get_total_required_shared_backward())
             for function in (*builder.kernels, *builder.functions):
-                shared_bytes += function.adj.get_total_required_shared_backward()
+                scratch = max(scratch, function.adj.max_required_sycl_tile_scratch)
                 for var in function.adj.variables:
                     if warp._src.types.is_tile(var.type):
                         element_size = warp._src.types.type_size_in_bytes(var.type.dtype)
-                        shared_bytes += 2 * var.type.size_in_bytes()
-                        shared_bytes += warp._src.types.tile.round_up((element_size + 8) * options["block_dim"])
-            builder.options = builder.options | {"sycl_shared_bytes": shared_bytes}
+                        scratch = max(
+                            scratch,
+                            2 * var.type.size_in_bytes()
+                            + warp._src.types.tile.round_up((element_size + 8) * options["block_dim"]),
+                        )
+            shared_bytes += frames + scratch
+            builder.options = builder.options | {
+                "sycl_shared_bytes": shared_bytes,
+                "sycl_module_hash": self.get_module_hash(options["block_dim"]).hex(),
+            }
             ext = "sycl.cpp"
             source = builder.codegen("sycl")
         elif is_cpu:
@@ -4913,9 +4928,7 @@ class Module:
 
         try:
             if is_sycl:
-                from warp._src.build_sycl import build_module  # noqa: PLC0415
-
-                build_module(output_path, source_code_path, options)
+                warp._src.build.build_sycl(output_path, source_code_path, options)
             elif is_cpu:
                 # build object code
                 with warp.ScopedTimer("Compile x86", active=warp.config.log_level <= warp.LOG_DEBUG):
@@ -5545,7 +5558,7 @@ class ContextGuard:
 
 
 class Event:
-    """A CUDA event that can be recorded onto a stream.
+    """A GPU event that can be recorded onto a CUDA or SYCL stream.
 
     Events can be used for device-side synchronization, which do not block
     the host thread.
@@ -5562,6 +5575,8 @@ class Event:
         """Create a new event instance."""
         instance = super().__new__(cls)
         instance.owner = False
+        instance.cuda_event = None
+        instance.sycl_event = None
         return instance
 
     def __init__(
@@ -5587,6 +5602,19 @@ class Event:
         """
 
         device = get_device(device)
+        if device.is_sycl:
+            from warp._src.sycl import check  # noqa: PLC0415
+
+            if interprocess:
+                raise NotImplementedError("SYCL events do not support interprocess use")
+            self.device = device
+            self.enable_timing = enable_timing
+            self.sycl_event = runtime.sycl.wp_sycl_event_create(device.context, int(enable_timing))
+            if not self.sycl_event:
+                check(runtime.sycl, -1)
+            self.owner = True
+            return
+
         if not device.is_cuda:
             raise RuntimeError(f"Device {device} is not a CUDA device")
 
@@ -5650,6 +5678,14 @@ class Event:
         This property may not be accessed during a graph capture on any stream.
         """
 
+        if self.device.is_sycl:
+            from warp._src.sycl import check  # noqa: PLC0415
+
+            result = runtime.sycl.wp_sycl_event_query(self.sycl_event)
+            if result < 0:
+                check(runtime.sycl, result)
+            return result == 0
+
         result_code = runtime.core.wp_cuda_event_query(self.cuda_event)
 
         return result_code == 0
@@ -5659,6 +5695,9 @@ class Event:
             return
 
         try:
+            if self.sycl_event is not None:
+                runtime.sycl.wp_sycl_event_destroy(self.sycl_event)
+                return
             runtime.core.wp_cuda_event_destroy(self.cuda_event)
         except (TypeError, AttributeError):
             # Suppress TypeError and AttributeError when callables become None during shutdown
@@ -5675,6 +5714,7 @@ class Stream:
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)
         instance.cuda_stream = None
+        instance.sycl_stream = None
         instance.owner = False
         return instance
 
@@ -5710,6 +5750,19 @@ class Stream:
                 "A Device object is required when creating a stream before or during Warp initialization"
             )
 
+        if device.is_sycl:
+            # a SYCL stream is an in-order queue; the device's default stream is passed as sycl_stream
+            self.device = device
+            self._is_blocking = True
+            if "sycl_stream" in kwargs:
+                self.sycl_stream = kwargs["sycl_stream"]
+            else:
+                self.sycl_stream = device.runtime.sycl.wp_sycl_stream_create(device.context)
+                if not self.sycl_stream:
+                    raise RuntimeError(f"Failed to create stream on device {device}")
+                self.owner = True
+            return
+
         if not device.is_cuda:
             raise RuntimeError(f"Device {device} is not a CUDA device")
 
@@ -5732,6 +5785,14 @@ class Stream:
             self.owner = True
 
     def __del__(self):
+        if self.sycl_stream:
+            try:
+                if self.owner:
+                    runtime.sycl.wp_sycl_stream_destroy(self.device.context, self.sycl_stream)
+            except (TypeError, AttributeError):
+                pass
+            return
+
         if not self.cuda_stream:
             return
 
@@ -5774,6 +5835,17 @@ class Stream:
                 f"Event from device {event.device} cannot be recorded on stream from device {self.device}"
             )
 
+        if self.device.is_sycl:
+            from warp._src.sycl import check  # noqa: PLC0415
+
+            check(
+                runtime.sycl,
+                runtime.sycl.wp_sycl_event_record(
+                    self.device.context, event.sycl_event, self.sycl_stream, int(external or event.enable_timing)
+                ),
+            )
+            return event
+
         runtime.core.wp_cuda_event_record(event.cuda_event, self.cuda_stream, external or event.enable_timing)
 
         return event
@@ -5788,6 +5860,19 @@ class Stream:
             external: Whether this is an external event during graph capture. This
                 argument has no effect outside of graph capture.
         """
+        if self.device.is_sycl:
+            from warp._src.sycl import check  # noqa: PLC0415
+
+            if event.device != self.device:
+                raise RuntimeError("SYCL event waits require an event on the same device as the stream")
+            check(
+                runtime.sycl,
+                runtime.sycl.wp_sycl_stream_wait_event(
+                    self.device.context, self.sycl_stream, event.sycl_event, int(external)
+                ),
+            )
+            return
+
         runtime.core.wp_cuda_stream_wait_event(self.cuda_stream, event.cuda_event, external)
 
     def wait_stream(self, other_stream: Stream, event: Event | None = None, external: bool = False):
@@ -5813,6 +5898,11 @@ class Stream:
         if event is None:
             event = other_stream.cached_event
 
+        if self.device.is_sycl:
+            other_stream.record_event(event, external=external)
+            self.wait_event(event, external=external)
+            return
+
         runtime.core.wp_cuda_stream_wait_stream(self.cuda_stream, other_stream.cuda_stream, event.cuda_event, external)
 
     @property
@@ -5822,6 +5912,9 @@ class Stream:
         This property may not be accessed during a graph capture on any stream.
         """
 
+        if self.device.is_sycl:
+            return runtime.sycl.wp_sycl_stream_query(self.sycl_stream) == 0
+
         result_code = runtime.core.wp_cuda_stream_query(self.cuda_stream)
 
         return result_code == 0
@@ -5829,6 +5922,8 @@ class Stream:
     @property
     def is_capturing(self) -> bool:
         """A boolean indicating whether a graph capture is currently ongoing on this stream."""
+        if self.device.is_sycl:
+            return bool(self.device.captures) and self.device.stream is self
         return bool(runtime.core.wp_cuda_stream_is_capturing(self.cuda_stream))
 
     @property
@@ -5844,6 +5939,8 @@ class Stream:
     @property
     def priority(self) -> int:
         """An integer representing the priority of the stream."""
+        if self.device.is_sycl:
+            return 0
         return runtime.core.wp_cuda_stream_get_priority(self.cuda_stream)
 
 
@@ -5951,14 +6048,15 @@ class Device:
         elif self.is_sycl:
             from warp._src.sycl import SyclAllocator, check  # noqa: PLC0415
 
-            library = runtime.sycl
-            self.name = library.wp_sycl_device_name(context).decode("utf-8")
+            # sycl device
+            self.name = runtime.sycl.wp_sycl_device_name(context).decode("utf-8")
             self.arch = 0
-            self.sm_count = 0
-            self.max_shared_memory_per_block = library.wp_sycl_device_local_memory_size(context)
-            self.max_work_group_size = library.wp_sycl_device_max_work_group_size(context)
-            self.supports_fp64 = bool(library.wp_sycl_device_has_fp64(context))
-            self.supports_atomic64 = bool(library.wp_sycl_device_has_atomic64(context))
+            self.sm_count = runtime.sycl.wp_sycl_device_compute_units(context)
+            self.max_resident_threads = runtime.sycl.wp_sycl_device_resident_threads(context)
+            self.max_shared_memory_per_block = runtime.sycl.wp_sycl_device_local_memory_size(context)
+            self.max_work_group_size = runtime.sycl.wp_sycl_device_max_work_group_size(context)
+            self.supports_fp64 = bool(runtime.sycl.wp_sycl_device_has_fp64(context))
+            self.supports_atomic64 = bool(runtime.sycl.wp_sycl_device_has_atomic64(context))
             self.is_uva = False
             self.is_cpu_memory_access_from_gpu_supported = False
             self.is_gpu_memory_access_from_cpu_supported = False
@@ -5972,9 +6070,12 @@ class Device:
             self.uuid = None
             self.pci_bus_id = None
             self.default_allocator = SyclAllocator(self)
-            self.memset = lambda ptr, value, size: check(library, library.wp_sycl_memset(context, ptr, value, size))
+            self._stream = Stream(self, sycl_stream=runtime.sycl.wp_sycl_stream_default(context))
+            self.memset = lambda ptr, value, size: check(
+                runtime.sycl, runtime.sycl.wp_sycl_memset(context, ptr, value, size)
+            )
             self.memtile = lambda ptr, src, size, count: check(
-                library, library.wp_sycl_memtile(context, ptr, src, size, count)
+                runtime.sycl, runtime.sycl.wp_sycl_memtile(context, ptr, src, size, count)
             )
         elif ordinal >= 0 and ordinal < runtime.core.wp_cuda_device_get_count():
             # CUDA device
@@ -6097,6 +6198,35 @@ class Device:
         return self.backend == "sycl"
 
     @property
+    def supports_graph_capture(self) -> bool:
+        """Whether ordinary graph capture and replay are supported on this device.
+
+        CPU devices record through APIC, CUDA devices use CUDA graphs, and SYCL
+        devices query command-graph support from their backend. Captured event
+        timing and conditional graphs have separate capabilities.
+        """
+        if self.is_sycl:
+            return bool(runtime.sycl.wp_sycl_graph_supported(self.context))
+        return self.is_cpu or self.is_cuda
+
+    @property
+    def is_graph_capture_event_supported(self) -> bool:
+        """Whether captured events can provide host-visible timing after graph replay."""
+        if self.is_sycl:
+            return bool(runtime.sycl.wp_sycl_graph_event_supported(self.context))
+        return self.is_cuda
+
+    @property
+    def is_conditional_graph_supported(self) -> bool:
+        """Whether captured conditional branches and loops are supported on this device.
+
+        CPU devices record conditionals through APIC. CUDA devices require CUDA
+        Toolkit and driver versions of at least 12.4. SYCL conditional graphs are
+        not yet supported.
+        """
+        return self.is_cpu or (self.is_cuda and is_conditional_graph_supported())
+
+    @property
     def is_capturing(self) -> bool:
         """A boolean indicating whether this device is currently capturing a graph.
 
@@ -6147,9 +6277,9 @@ class Device:
         """The stream associated with a CUDA device.
 
         Raises:
-            RuntimeError: The device is not a CUDA device.
+            RuntimeError: The device is not a CUDA or SYCL device.
         """
-        if self.is_cuda and self.context:
+        if (self.is_cuda and self.context) or self.is_sycl:
             return self._stream
         else:
             raise RuntimeError(f"Device {self} is not a CUDA device")
@@ -6180,6 +6310,17 @@ class Device:
 
             self.runtime.core.wp_cuda_context_set_stream(self.context, stream.cuda_stream, int(sync))
             self._stream = stream
+        elif self.is_sycl:
+            from warp._src.sycl import check  # noqa: PLC0415
+
+            if stream.device != self:
+                raise RuntimeError(f"Stream from device {stream.device} cannot be used on device {self}")
+
+            check(
+                self.runtime.sycl,
+                self.runtime.sycl.wp_sycl_stream_set_current(self.context, stream.sycl_stream, int(sync)),
+            )
+            self._stream = stream
         else:
             raise RuntimeError(f"Device {self} is not a CUDA device")
 
@@ -6187,6 +6328,18 @@ class Device:
     def has_stream(self) -> bool:
         """A boolean indicating whether the device has a stream associated with it."""
         return self._stream is not None
+
+    def _sycl_memory_info(self) -> tuple[int, int]:
+        """Returns the free and total memory of a SYCL device in bytes (free is 0 when the runtime cannot report it)."""
+        from warp._src.sycl import check  # noqa: PLC0415
+
+        free_mem = ctypes.c_size_t()
+        total_mem = ctypes.c_size_t()
+        library = self.runtime.sycl
+        check(
+            library, library.wp_sycl_device_memory_info(self.context, ctypes.byref(free_mem), ctypes.byref(total_mem))
+        )
+        return free_mem.value, total_mem.value
 
     @property
     def total_memory(self) -> int:
@@ -6199,6 +6352,8 @@ class Device:
             total_mem = ctypes.c_size_t()
             self.runtime.core.wp_cuda_device_get_memory_info(self.ordinal, None, ctypes.byref(total_mem))
             return total_mem.value
+        elif self.is_sycl:
+            return self._sycl_memory_info()[1]
         else:
             try:
                 import psutil  # noqa: PLC0415
@@ -6224,6 +6379,8 @@ class Device:
             free_mem = ctypes.c_size_t()
             self.runtime.core.wp_cuda_device_get_memory_info(self.ordinal, ctypes.byref(free_mem), None)
             return free_mem.value
+        elif self.is_sycl:
+            return self._sycl_memory_info()[0]
         else:
             try:
                 import psutil  # noqa: PLC0415
@@ -6549,7 +6706,8 @@ class Graph:
             if self.device.is_sycl:
                 from warp._src.sycl import check  # noqa: PLC0415
 
-                check(runtime.sycl, runtime.sycl.wp_sycl_graph_destroy(self.device.context, self.graph))
+                graph, self.graph = self.graph, None
+                check(runtime.sycl, runtime.sycl.wp_sycl_graph_destroy(self.device.context, graph))
                 return
             with self.device.context_guard:
                 runtime.core.wp_cuda_graph_destroy(self.device.context, self.graph)
@@ -6559,7 +6717,7 @@ class Graph:
             # Suppress TypeError and AttributeError when callables become None during shutdown
             pass
 
-    # retain executable CUDA modules used by this graph, which prevents them from being unloaded
+    # retain executable GPU modules used by this graph, which prevents them from being unloaded
     def _retain_module_exec(self, module_exec: ModuleExec):
         self.module_execs.add(module_exec)
 
@@ -9296,11 +9454,14 @@ def _is_graph_capture_allocation_supported(device: DeviceLike) -> bool:
     separate from the public memory-pool API. CUDA requires a memory pool because
     ``cudaMalloc`` is not capture-safe, so the answer derives from mempool support.
     CPU/APIC capture allocates through the host allocator and stays valid via APIC
-    region tracking + retention, so allocation during capture is always supported.
+    region tracking + retention. SYCL uses device USM with shared graph/user
+    ownership, so no CUDA-style memory pool is required.
     """
     device = runtime.get_device(device)
     if device.is_cpu:
         return True
+    if device.is_sycl:
+        return device.supports_graph_capture
     return device.is_mempool_supported
 
 
@@ -9308,12 +9469,14 @@ def _is_graph_capture_allocation_enabled(device: DeviceLike) -> bool:
     """Whether allocation during a graph capture is currently enabled on ``device``.
 
     CUDA derives this from whether its memory pool is enabled (the pool allocator must
-    be active for ``cudaMallocAsync`` during capture); CPU is always enabled because
-    host allocation needs no pool.
+    be active for ``cudaMallocAsync`` during capture). CPU and graph-capable SYCL
+    devices need no pool or separate allocator toggle.
     """
     device = runtime.get_device(device)
     if device.is_cpu:
         return True
+    if device.is_sycl:
+        return device.supports_graph_capture
     return device.is_mempool_enabled
 
 
@@ -9907,9 +10070,24 @@ def get_event_elapsed_time(start_event: Event, end_event: Event, synchronize: bo
         so short operations may appear longer than actual.
     """
 
+    if start_event.device != end_event.device:
+        raise RuntimeError("Timing events must belong to the same device")
+
     # ensure the end_event is reached
     if synchronize:
         synchronize_event(end_event)
+
+    if start_event.device.is_sycl:
+        from warp._src.sycl import check  # noqa: PLC0415
+
+        milliseconds = ctypes.c_float()
+        check(
+            runtime.sycl,
+            runtime.sycl.wp_sycl_event_elapsed_time(
+                start_event.sycl_event, end_event.sycl_event, ctypes.byref(milliseconds)
+            ),
+        )
+        return milliseconds.value
 
     return runtime.core.wp_cuda_event_elapsed_time(start_event.cuda_event, end_event.cuda_event)
 
@@ -11813,7 +11991,7 @@ def launch(
         record_cmd: When ``True``, the launch will return a :class:`Launch`
           object. The launch will not occur until the user calls
           :meth:`Launch.launch()`.
-        max_blocks: The maximum number of CUDA thread blocks to use.
+        max_blocks: The maximum number of CUDA thread blocks to use. Ignored on CPU and SYCL devices.
           Requires a grid-stride loop, which is the default. Launching a
           kernel that opted into the lean launch path with
           ``@wp.kernel(grid_stride=False)`` and ``max_blocks > 0`` raises
@@ -11971,10 +12149,6 @@ def launch(
 
         # run kernel
         elif device.is_sycl:
-            if stream is not None:
-                raise NotImplementedError("SYCL launches do not support CUDA streams")
-            if max_blocks:
-                raise NotImplementedError("SYCL launches do not yet support max_blocks")
             if block_dim > device.max_work_group_size:
                 raise ValueError(f"block_dim={block_dim} exceeds the SYCL device work-group limit")
             if record_cmd:
@@ -11983,7 +12157,16 @@ def launch(
                 graph = device.captures[None]
                 graph._retain_module_exec(module_exec)
                 graph._sycl_refs.extend((*fwd_args, *adj_args))
-            invoke(kernel, hooks, params, adjoint)
+            if stream is not None and stream is not device.stream:
+                # the native launch uses the device's current stream
+                previous_stream = device.stream
+                device.set_stream(stream, sync=False)
+                try:
+                    invoke(kernel, hooks, params, adjoint)
+                finally:
+                    device.set_stream(previous_stream, sync=False)
+            else:
+                invoke(kernel, hooks, params, adjoint)
         elif device.is_cpu:
             if adjoint:
                 if hooks.backward is None:
@@ -12413,7 +12596,8 @@ def get_suggested_block_size(kernel, device: DeviceLike = None) -> tuple[int, in
             ``@wp.kernel`` or the :class:`warp.Kernel` constructor. For a
             generic kernel, pass an overload returned by :func:`warp.overload`.
         device: The target device. If ``device`` is ``None``, Warp uses the default device.
-            For CPU devices, ``get_suggested_block_size()`` returns ``(1, 1)``.
+            For CPU devices, ``get_suggested_block_size()`` returns ``(1, 1)``. For SYCL devices it returns a
+            heuristic based on the device's hardware threads, since there is no occupancy query.
 
     Returns:
         A tuple ``(block_size, min_grid_size)`` where ``block_size`` is the
@@ -12433,6 +12617,12 @@ def get_suggested_block_size(kernel, device: DeviceLike = None) -> tuple[int, in
         raise TypeError(f"get_suggested_block_size() expected a wp.Kernel, got {type(kernel)}")
 
     device = runtime.get_device(device)
+
+    if device.is_sycl:
+        # There is no occupancy API: use a typical work-group size and enough work-groups to fill the
+        # hardware threads of the device.
+        block_size = min(256, device.max_work_group_size)
+        return (block_size, max(1, device.max_resident_threads // block_size))
 
     if not device.is_cuda:
         return (1, 1)
@@ -12552,11 +12742,16 @@ def synchronize_stream(stream_or_device: Stream | DeviceLike | None = None):
         stream = stream_or_device
     else:
         device = runtime.get_device(stream_or_device)
-        stream = device.stream if device.is_cuda else None
+        stream = device.stream if (device.is_cuda or device.is_sycl) else None
 
     if stream is not None:
         if stream.device.is_capturing:
             raise RuntimeError("Cannot synchronize stream while graph capture is active")
+        if stream.device.is_sycl:
+            from warp._src.sycl import check  # noqa: PLC0415
+
+            check(runtime.sycl, runtime.sycl.wp_sycl_stream_synchronize(stream.device.context, stream.sycl_stream))
+            return
         runtime.core.wp_cuda_stream_synchronize(stream.cuda_stream)
 
 
@@ -12625,6 +12820,12 @@ def synchronize_event(event: Event):
 
     if event.device.is_capturing:
         raise RuntimeError("Cannot synchronize event while graph capture is active")
+
+    if event.device.is_sycl:
+        from warp._src.sycl import check  # noqa: PLC0415
+
+        check(runtime.sycl, runtime.sycl.wp_sycl_event_synchronize(event.sycl_event))
+        return
 
     runtime.core.wp_cuda_event_synchronize(event.cuda_event)
 
@@ -13315,7 +13516,8 @@ def capture_begin(
     Records supported Warp operations subsequently issued on the selected
     device. On CUDA devices, the CUDA driver captures operations into a CUDA
     graph. On CPU devices, operations are recorded into an API Capture (APIC)
-    operation stream, which :func:`capture_launch` replays in C++.
+    operation stream, which :func:`capture_launch` replays in C++. On SYCL devices,
+    operations on the current in-order queue are recorded into a command graph.
 
     If ``apic=True``, APIC recording is also performed alongside CUDA graph
     capture, and the result can be serialized to a ``.wrp`` file via
@@ -13323,7 +13525,7 @@ def capture_begin(
     there) beyond gating whether :func:`capture_save` is allowed.
 
     Args:
-        device: The device to capture on (CUDA or CPU).
+        device: The device to capture on (CUDA, CPU, or SYCL).
         stream: The CUDA stream to capture on (CUDA only).
         force_module_load: Whether to force loading of all kernels before capture.
           In general it is better to use :func:`~warp.load_module()` to selectively load kernels.
@@ -13356,7 +13558,7 @@ def capture_begin(
     if runtime._apic_capture is not None:
         raise RuntimeError("Graph capture already in progress")
 
-    # ---- CPU capture path ----
+    # ---- SYCL capture path ----
     if device.is_sycl:
         from warp._src.sycl import check  # noqa: PLC0415
 
@@ -13370,7 +13572,12 @@ def capture_begin(
         graph.graph = runtime.sycl.wp_sycl_graph_begin(device.context)
         if graph.graph is None:
             check(runtime.sycl, -1)
-        device.captures[None] = graph
+        try:
+            device.captures[None] = graph
+        except Exception:
+            handle, graph.graph = graph.graph, None
+            check(runtime.sycl, runtime.sycl.wp_sycl_graph_destroy(device.context, handle))
+            raise
         return
 
     if device.is_cpu:
@@ -13486,10 +13693,17 @@ def capture_end(device: DeviceLike = None, stream: Stream | None = None) -> Grap
         if device.is_sycl:
             from warp._src.sycl import check  # noqa: PLC0415
 
-            graph = device.captures.pop(None, None)
+            graph = device.captures.get(None)
             if graph is None:
                 raise RuntimeError("Graph capture is not active on this SYCL device")
-            check(runtime.sycl, runtime.sycl.wp_sycl_graph_end(device.context, graph.graph))
+            try:
+                check(runtime.sycl, runtime.sycl.wp_sycl_graph_end(device.context, graph.graph))
+            except Exception:
+                handle, graph.graph = graph.graph, None
+                check(runtime.sycl, runtime.sycl.wp_sycl_graph_destroy(device.context, handle))
+                raise
+            finally:
+                device.captures.pop(None, None)
             return graph
         if not device.is_cuda:
             raise RuntimeError("Must be a CUDA device")
@@ -13553,9 +13767,11 @@ def assert_conditional_graph_support():
 
 
 def is_conditional_graph_supported() -> bool:
-    """Check whether conditional graph nodes are supported.
+    """Check whether CUDA conditional graph nodes are supported.
 
     Conditional graph nodes require a CUDA driver 12.4+ and Warp to be built with CUDA Toolkit 12.4+.
+    For a device-specific query, including CPU/APIC support, use
+    :attr:`Device.is_conditional_graph_supported`.
 
     Returns:
         ``True`` if both the CUDA Toolkit and driver versions are at least 12.4, ``False`` otherwise.
@@ -14202,6 +14418,8 @@ def capture_launch(graph: Graph, stream: Stream | None = None):
         if stream is not None:
             raise NotImplementedError("SYCL graphs do not support CUDA streams")
         check(runtime.sycl, runtime.sycl.wp_sycl_graph_launch(graph.device.context, graph.graph))
+        if graph.device.is_capturing:
+            graph.device.captures[None]._sycl_refs.append(graph)
         return
 
     # ---- APIC loaded graph path ----

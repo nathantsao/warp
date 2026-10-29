@@ -117,7 +117,27 @@ def array_scan(in_array: wp.array, out_array: wp.array, inclusive: bool = True) 
         apic_capture.track_array(out_array)
 
     if in_array.device.is_sycl:
-        raise NotImplementedError("array_scan() is not yet supported on SYCL; use a tiled kernel")
+        from warp._src.sycl import SCAN_TYPES, check, retain_arrays  # noqa: PLC0415
+
+        type_code = SCAN_TYPES.get(scalar_type)
+        if type_code is None:
+            raise RuntimeError(f"Unsupported data type: {type_repr(in_array.dtype)}")
+        retain_arrays(in_array.device, in_array, out_array)
+        check(
+            runtime.sycl,
+            runtime.sycl.wp_sycl_array_scan(
+                in_array.device.context,
+                type_code,
+                in_array.ptr,
+                out_array.ptr,
+                in_array.size,
+                in_stride,
+                out_stride,
+                type_length,
+                inclusive,
+            ),
+        )
+        return
     if in_array.device.is_cpu:
         if scalar_type == wp.int32:
             native_func = runtime.core.wp_array_scan_int_host
@@ -226,7 +246,21 @@ def radix_sort_pairs(
         apic_capture.track_array(values)
 
     if keys.device.is_sycl:
-        raise NotImplementedError("radix_sort_pairs() is not yet supported on SYCL")
+        from warp._src.sycl import SORT_KEY_TYPES, check, retain_arrays  # noqa: PLC0415
+
+        key_type = SORT_KEY_TYPES.get(keys.dtype)
+        if key_type is None:
+            raise RuntimeError(
+                f"Unsupported keys and values data types: {type_repr(keys.dtype)}, {type_repr(values.dtype)}"
+            )
+        retain_arrays(keys.device, keys, values)
+        check(
+            runtime.sycl,
+            runtime.sycl.wp_sycl_radix_sort_pairs(
+                keys.device.context, key_type, keys.ptr, values.ptr, count, begin_bit, end_bit, value_size
+            ),
+        )
+        return
     if keys.device.is_cpu:
         if keys.dtype == wp.int32:
             runtime.core.wp_radix_sort_pairs_int_host(keys.ptr, values.ptr, count, begin_bit, end_bit, value_size)
@@ -283,8 +317,8 @@ def segmented_sort_pairs(
     During direct CPU execution, Warp raises a :class:`ValueError` for invalid
     segment bounds. If invalid bounds are encountered during CPU graph replay,
     :func:`warp.capture_launch` raises a :class:`RuntimeError`. For execution
-    on a CUDA device, Warp does not currently report invalid segment bounds, so
-    callers must validate segment ranges before calling this function.
+    on CUDA and SYCL devices, Warp does not currently report invalid segment
+    bounds, so callers must validate segment ranges before calling this function.
 
     All provided arrays must be contiguous and reside on the same device. The
     segment-index arrays must be one-dimensional.
@@ -416,7 +450,25 @@ def segmented_sort_pairs(
         apic_capture.track_array(segment_end_indices)
 
     if keys.device.is_sycl:
-        raise NotImplementedError("segmented_sort_pairs() is not yet supported on SYCL")
+        from warp._src.sycl import SORT_KEY_TYPES, check, retain_arrays  # noqa: PLC0415
+
+        if keys.dtype not in (wp.int32, wp.float32) or values.dtype != wp.int32:
+            raise RuntimeError(f"Unsupported data type: {type_repr(keys.dtype)}")
+        retain_arrays(keys.device, keys, values, segment_start_indices, segment_end_indices)
+        check(
+            runtime.sycl,
+            runtime.sycl.wp_sycl_segmented_sort_pairs(
+                keys.device.context,
+                SORT_KEY_TYPES[keys.dtype],
+                keys.ptr,
+                values.ptr,
+                count,
+                segment_start_indices_ptr,
+                segment_end_indices_ptr,
+                num_segments,
+            ),
+        )
+        return
     if keys.device.is_cpu:
         if keys.dtype == wp.int32 and values.dtype == wp.int32:
             success = runtime.core.wp_segmented_sort_pairs_int_host(
@@ -2064,11 +2116,11 @@ class ScopedCapture:
     """Context manager to capture a sequence of operations into a graph.
 
     Captures supported Warp operations for later replay with reduced launch
-    overhead. Works on both CPU and CUDA devices. The captured graph is
+    overhead. Works on CPU, CUDA, and SYCL devices. The captured graph is
     available as the ``graph`` attribute after exiting the context.
 
     Args:
-        device: Device on which to capture operations (CPU or CUDA).
+        device: Device on which to capture operations (CPU, CUDA, or SYCL).
         stream: Stream on which to capture operations (CUDA only).
         force_module_load: If ``True``, force all modules to load before capture begins.
         external: If ``True``, indicates an external CUDA graph capture is already active.

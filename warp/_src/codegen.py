@@ -2252,6 +2252,10 @@ class Adjoint:
         # backward-pass counterpart, resolved by ModuleBuilder._propagate_backward_shared_memory
         adj.max_required_extra_shared_memory_backward = 0
 
+        # SYCL tile operations reuse transient workspace outside the callee frames.
+        adj.max_required_sycl_tile_scratch = 0
+        adj.uses_sycl_tile_sort = False
+
         # recorded at call sites for ModuleBuilder's post-build propagation passes
         adj.called_user_functions = {}
 
@@ -2869,13 +2873,8 @@ class Adjoint:
                 func.key.startswith(("volume_", "hash_grid_", "texture_"))
                 or func.key
                 in (
-                    "tile_sort",
                     "tile_fft",
                     "tile_ifft",
-                    "tile_matmul",
-                    "tile_cholesky",
-                    "tile_cholesky_solve",
-                    "tile_solve",
                 )
             ):
                 raise WarpCodegenError(f"{func.key}() is not yet supported on SYCL")
@@ -2995,6 +2994,17 @@ class Adjoint:
         # for example by checking whether an argument corresponds to
         # a literal value or references a variable.
         extra_shared_memory = 0
+        if adj.builder_options.get("target_backend") == "sycl" and func.is_builtin() and func.key == "tile_sort":
+            adj.uses_sycl_tile_sort = True
+            keys = strip_reference(bound_arg_types["keys"])
+            values = strip_reference(bound_arg_types["values"])
+            if keys.size & (keys.size - 1):
+                padded_size = 1 << (keys.size - 1).bit_length()
+                sort_scratch = sum(
+                    tile.round_up(type_size_in_bytes(dtype) * padded_size)
+                    for dtype in (keys.dtype, values.dtype, warp.bool)
+                )
+                adj.max_required_sycl_tile_scratch = max(adj.max_required_sycl_tile_scratch, sort_scratch)
         func_arg_names = tuple(bound_args.keys())
         if func.lto_dispatch_func is not None:
             func_args, template_args, _ltoirs, extra_shared_memory = func.lto_dispatch_func(
@@ -3072,7 +3082,19 @@ class Adjoint:
         det_args = adj.deterministic.call_args(func, bound_args)
         replay_det_args = adj.deterministic.replay_call_args(func, bound_args, det_args)
 
-        if return_type is None:
+        is_sycl_printf = (
+            func.key == "printf" and adj.builder is not None and adj.builder.options.get("target_backend") == "sycl"
+        )
+        if is_sycl_printf:
+            # SYCL device printf requires the format string to be a literal
+            fmt = fwd_args[0]
+            if not isinstance(fmt, Var) or not isinstance(fmt.constant, str):
+                raise WarpCodegenError("wp.printf() requires a constant format string on SYCL")
+            printf_args = ", ".join([constant_str(fmt.constant), *adj.format_args("var", fwd_args[1:])])
+            forward_call = f"builtin_printf({printf_args});"
+            replay_call = forward_call
+
+        elif return_type is None:
             # handles expression (zero output) functions, e.g.: void do_something();
             forward_call = f"{func.namespace}{func_name}({adj.format_forward_call_args(fwd_args + det_args, use_initializer_list)});"
             replay_call = forward_call
@@ -7188,6 +7210,12 @@ sycl_module_header = """
 #define builtin_tid3d(x, y, z) wp::tid(x, y, z, task_index, dim)
 #define builtin_tid4d(x, y, z, w) wp::tid(x, y, z, w, task_index, dim)
 #define builtin_block_dim() wp::block_dim()
+
+#if defined(__SYCL_DEVICE_ONLY__)
+#define builtin_printf(...) sycl::ext::oneapi::experimental::printf(__VA_ARGS__)
+#else
+#define builtin_printf(...) printf(__VA_ARGS__)
+#endif
 """
 
 cuda_module_header = """
@@ -8574,53 +8602,107 @@ def codegen_sycl_module(kernel, options):
     pending = [adj]
     visited = set()
     uses_tiles = False
+    uses_tile_sort = False
     while pending:
         function_adj = pending.pop()
         if function_adj in visited:
             continue
         visited.add(function_adj)
         uses_tiles |= any(is_tile(var.type) or is_tile_stack(var.type) for var in function_adj.variables)
+        uses_tile_sort |= function_adj.uses_sycl_tile_sort
         pending.extend(function.adj for function in function_adj.called_user_functions)
     name = kernel.get_mangled_name()
+    tile_init = "                wp::tile_shared_storage_t tile_storage;\n" if uses_tiles else ""
+    tile_sort_validate = (
+        f'        if (dim.size % {options["block_dim"]} != 0)\n'
+        '            throw std::runtime_error("SYCL tile_sort launches require complete work-groups");\n'
+        if uses_tile_sort
+        else ""
+    )
+
+    def lambda_body(local_args, local_adj, entry, adj_call):
+        return f"""[=](sycl::nd_item<1> item) {{
+                const size_t task_index = offset + item.get_global_linear_id();
+                if (task_index >= dim.size)
+                    return;
+{local_args}{local_adj}#if defined(__SYCL_DEVICE_ONLY__)
+{tile_init}                {entry}(dim, task_index, &local_args{adj_call});
+#endif
+            }}"""
+
+    def submit_ranges(body, tag):
+        if uses_tiles:
+            # A smaller physical tail group preserves the logical block's register layout
+            # while allowing every work-item to participate in its collective barriers.
+            dispatch = """        const size_t full_size = dim.size / block_size * block_size;
+        if (full_size)
+            submit(0, full_size, block_size);
+        const size_t tail_size = dim.size - full_size;
+        if (tail_size)
+            submit(full_size, tail_size, tail_size);
+"""
+        else:
+            dispatch = """        const size_t global_size = ((dim.size + block_size - 1) / block_size) * block_size;
+        submit(0, global_size, block_size);
+"""
+        return f"""        const auto submit = [&](size_t offset, size_t count, size_t local_size) {{
+            const sycl::nd_range<1> range(count, local_size);
+            queue.parallel_for<{tag}<block_size, WP_SYCL_SHARED_BYTES>>(
+                range, {body});
+        }};
+{dispatch}"""
+
     source = ""
     for direction in ("forward", "backward") if options["enable_backward"] else ("forward",):
         backward = direction == "backward"
         adj_param = f", wp_args_{name}* adj_args" if backward else ""
-        adj_capture = "    const auto adj_values = *adj_args;\n" if backward else ""
-        adj_local = "            auto local_adj_args = adj_values;\n" if backward else ""
-        adj_call = ", &local_adj_args" if backward else ""
-        tile_init = "            wp::tile_shared_storage_t tile_storage;\n" if uses_tiles else ""
-        tile_validate = (
-            "        if (dim.size % local_size != 0)\n"
-            '            throw std::runtime_error("SYCL tile launches require complete work-groups");\n'
-            if uses_tiles
+        submit_adj_param = ", Args* adj_args" if backward else ""
+        adj_value = "        const auto adj_values = *adj_args;\n" if backward else ""
+        adj_staged = (
+            "        auto* staged_adj_args = static_cast<Args*>(\n"
+            "            wp::sycl_stage_args(device, adj_args, sizeof(*adj_args)));\n"
+            if backward
             else ""
         )
+        adj_local = "                auto local_adj_args = adj_values;\n" if backward else ""
+        adj_staged_local = "                auto local_adj_args = *staged_adj_args;\n" if backward else ""
+        adj_call = ", &local_adj_args" if backward else ""
+        adj_size = " + sizeof(wp_args_" + name + ")" if backward else ""
+        entry = f"{name}_sycl_kernel_{direction}"
+        tag = f"{name}_sycl_{direction}_tag_{options['sycl_module_hash']}"
+        by_value = lambda_body("                auto local_args = values;\n", adj_local, entry, adj_call)
+        staged = lambda_body("                auto local_args = *staged_args;\n", adj_staged_local, entry, adj_call)
+        # Arguments that do not fit in the kernel parameter space are read from USM staging memory instead.
+        # Only the selected branch is instantiated, so a by-value kernel is never emitted for them.
         source += f"""
-template <int BlockDim, int SharedBytes> class {name}_sycl_{direction}_tag;
+template <int BlockDim, int SharedBytes> class {tag};
+
+template <bool Staged, typename Args>
+static void {name}_sycl_submit_{direction}(
+    void* device, const wp::launch_bounds_t<{adj.kernel_dim}>& dim, Args* args{submit_adj_param})
+{{
+    constexpr size_t block_size = {options["block_dim"]};
+    auto& queue = wp::sycl_queue(device);
+    if constexpr (Staged) {{
+        auto* staged_args = static_cast<Args*>(wp::sycl_stage_args(device, args, sizeof(*args)));
+{adj_staged}{submit_ranges(staged, tag)}
+    }} else {{
+        const auto values = *args;
+{adj_value}{submit_ranges(by_value, tag)}
+    }}
+}}
 
 extern "C" WP_API int {name}_sycl_{direction}(
     void* device, wp::launch_bounds_t<{adj.kernel_dim}>* bounds, wp_args_{name}* args{adj_param})
 {{
     const auto dim = *bounds;
-    const auto values = *args;
-{adj_capture}
     return wp::sycl_checked([&] {{
         if (dim.size == 0)
             return;
-        constexpr size_t local_size = {options["block_dim"]};
-{tile_validate}
-        const size_t global_size = ((dim.size + local_size - 1) / local_size) * local_size;
-        wp::sycl_queue(device).parallel_for<{name}_sycl_{direction}_tag<local_size, WP_SYCL_SHARED_BYTES>>(
-            sycl::nd_range<1>(global_size, local_size), [=](sycl::nd_item<1> item) {{
-            const size_t task_index = item.get_global_linear_id();
-            if (task_index >= dim.size)
-                return;
-{tile_init}
-            auto local_args = values;
-{adj_local}
-            {name}_sycl_kernel_{direction}(dim, task_index, &local_args{adj_call});
-        }});
+{tile_sort_validate}
+        constexpr bool staged =
+            sizeof(dim) + sizeof(wp_args_{name}){adj_size} + 64 > WP_SYCL_MAX_KERNEL_ARG_BYTES;
+        {name}_sycl_submit_{direction}<staged>(device, dim, args{", adj_args" if backward else ""});
     }});
 }}
 """

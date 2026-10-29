@@ -1549,6 +1549,37 @@ stream in C++. Both paths use the same
 supported CPU or CUDA graphs for later replay from Python or a standalone C++
 program; see :ref:`cpu_graphs` and :ref:`apic_save_load`.
 
+SYCL devices use the oneAPI command-graph extension when supported by the selected
+device. Query graph features independently rather than inferring them from a
+backend name:
+
+.. list-table:: Device graph capabilities
+    :header-rows: 1
+    :widths: 37 18 20 25
+
+    * - Device property
+      - CPU
+      - CUDA
+      - SYCL
+    * - :attr:`~warp.Device.supports_graph_capture`
+      - Yes, through APIC
+      - Yes
+      - Backend command-graph support
+    * - :attr:`~warp.Device.is_graph_capture_event_supported`
+      - No
+      - Yes
+      - Supported Level Zero v2 native recording, host USM and an immediate queue
+    * - :attr:`~warp.Device.is_conditional_graph_supported`
+      - Yes, through APIC
+      - CUDA Toolkit and driver 12.4+
+      - Not yet supported
+
+Ordinary capture support does not imply support for every operation, capture
+option, allocation mode or workload. These queries do not enable memory pools or
+change runtime selection. The existing :func:`~warp.is_conditional_graph_supported`
+function remains a CUDA Toolkit/driver query; use the device property for a
+backend-neutral answer. SYCL graph serialization through APIC is not yet supported.
+
 To record a sequence of operations, use
 :func:`wp.capture_begin() <warp.capture_begin>` and
 :func:`wp.capture_end() <warp.capture_end>` as follows:

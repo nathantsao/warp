@@ -16,6 +16,19 @@ inline auto sycl_work_item() { return sycl::ext::oneapi::this_work_item::get_nd_
 
 inline void sycl_tile_sync() { sycl::group_barrier(sycl_work_item().get_group()); }
 
+inline int sycl_tile_active_count() { return int(sycl_work_item().get_local_range(0)); }
+
+inline void sycl_tile_clear_flags(bool* flags)
+{
+    const int tid = int(sycl_work_item().get_local_linear_id());
+    const int active_count = sycl_tile_active_count();
+    for (int base = 0; base < WP_TILE_BLOCK_DIM; base += active_count) {
+        const int i = base + tid;
+        if (i < WP_TILE_BLOCK_DIM)
+            flags[i] = false;
+    }
+}
+
 inline unsigned int* sycl_tile_offsets()
 {
     sycl::ext::oneapi::experimental::work_group_static<unsigned int[WP_TILE_BLOCK_DIM]> offsets;

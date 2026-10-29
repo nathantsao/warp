@@ -3,6 +3,7 @@
 
 import types
 import unittest
+from unittest import mock
 
 import warp as wp
 from warp.tests.unittest_utils import *
@@ -86,6 +87,67 @@ devices = get_test_devices()
 
 
 class TestDevices(unittest.TestCase):
+    def test_devices_graph_capabilities(self):
+        runtime = wp._src.context.runtime
+        for device in wp.get_devices():
+            with self.subTest(device=device):
+                if device.is_sycl:
+                    self.assertIs(
+                        device.supports_graph_capture,
+                        bool(runtime.sycl.wp_sycl_graph_supported(device.context)),
+                    )
+                    self.assertIs(
+                        device.is_graph_capture_event_supported,
+                        bool(runtime.sycl.wp_sycl_graph_event_supported(device.context)),
+                    )
+                    self.assertFalse(device.is_conditional_graph_supported)
+                else:
+                    self.assertTrue(device.supports_graph_capture)
+                    self.assertIs(device.is_graph_capture_event_supported, device.is_cuda)
+                    self.assertIs(
+                        device.is_conditional_graph_supported,
+                        device.is_cpu or wp.is_conditional_graph_supported(),
+                    )
+
+    def test_devices_graph_capabilities_sycl(self):
+        device = object.__new__(wp.Device)
+        device.backend = "sycl"
+        device._context = mock.sentinel.sycl_context
+        native = mock.Mock(spec=("wp_sycl_graph_supported", "wp_sycl_graph_event_supported"))
+        with mock.patch.object(wp._src.context.runtime, "sycl", native):
+            for graphs, events in ((False, False), (True, False), (True, True)):
+                with self.subTest(graphs=graphs, events=events):
+                    native.wp_sycl_graph_supported.return_value = int(graphs)
+                    native.wp_sycl_graph_event_supported.return_value = int(events)
+                    self.assertIs(device.supports_graph_capture, graphs)
+                    self.assertIs(device.is_graph_capture_event_supported, events)
+                    self.assertFalse(device.is_conditional_graph_supported)
+                    native.wp_sycl_graph_supported.assert_called_with(device.context)
+                    native.wp_sycl_graph_event_supported.assert_called_with(device.context)
+
+    def test_devices_conditional_graph_capability_cuda_versions(self):
+        device = object.__new__(wp.Device)
+        device.backend = "cuda"
+        runtime = wp._src.context.runtime
+        for toolkit, driver, supported in (
+            (None, None, False),
+            (None, (12, 4), False),
+            ((12, 4), None, False),
+            ((12, 3), (12, 4), False),
+            ((12, 4), (12, 3), False),
+            ((12, 4), (12, 4), True),
+            ((13, 0), (13, 0), True),
+        ):
+            with (
+                self.subTest(toolkit=toolkit, driver=driver),
+                mock.patch.object(runtime, "toolkit_version", toolkit),
+                mock.patch.object(runtime, "driver_version", driver),
+            ):
+                self.assertTrue(device.supports_graph_capture)
+                self.assertTrue(device.is_graph_capture_event_supported)
+                self.assertIs(device.is_conditional_graph_supported, supported)
+                self.assertIs(wp.is_conditional_graph_supported(), supported)
+
     def test_devices_unmap_imaginary_device(self):
         with self.assertRaises(RuntimeError):
             wp.unmap_cuda_device("imaginary_device:0")

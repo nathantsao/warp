@@ -260,6 +260,33 @@ separate graph build flag. The oneAPI compiler must provide the command-graph
 extension. Devices without graph support can still run ordinary kernels, but
 graph capture raises an error.
 
+Warp preserves the oneAPI adapter selection. Use
+``SYCL_UR_USE_LEVEL_ZERO_V2=1`` before importing Warp to select Level Zero v2
+explicitly. Warp does not patch or rebuild Intel libraries or override
+``SYCL_UR_USE_LEVEL_ZERO_V2`` or ``UR_ADAPTERS_FORCE_LOAD`` settings.
+
+On supported v2 devices, Warp creates graphs with
+``property::graph::enable_native_recording``. Captured timing events append native
+GPU timestamp commands directly to the recording queue, avoiding the older
+command-buffer native-callback path. Timestamps are refreshed on every replay;
+no kernel or timestamp is executed during capture. Samples reside in host USM,
+allowing synchronized CPU readback without shared-USM migration faults or
+conflicts with Python's ``faulthandler``.
+
+Nested captures retain ordered native graph segments because native graph
+launches are not captured correctly by every driver. Replay submits those GPU
+graphs asynchronously in stream order, with an additional submission at each
+nesting boundary. Captures without child graphs remain a single submission.
+
+Check ``device.supports_graph_capture`` for ordinary recording and replay, and
+``device.is_graph_capture_event_supported`` before enabling captured event
+timing. It requires v2 native-recording support, host USM, and an immediate
+queue. Other devices/adapters retain ordinary command-graph capture and uncaptured
+event timing; captured external/timing events raise an explicit error. Host waits
+on captured external events conservatively wait for their containing graph.
+``device.is_conditional_graph_supported`` is a separate capability and remains
+false for SYCL.
+
 Select the backend explicitly:
 
 .. code-block:: python
@@ -272,20 +299,34 @@ Select the backend explicitly:
     result = values.numpy()  # explicit, synchronized host readback
 
 The first stage supports ordinary kernels and gradients, regular/strided
-arrays, basic cooperative tiles, BVH/mesh queries, and basic graph replay.
+arrays, basic cooperative tiles, BVH/mesh queries, and graph capture/replay
+with array allocations and event timing during capture.
 It has been validated with oneAPI 2026.1.1 on Intel Arc Pro B70.
 SYCL remains distinct from CPU and CUDA; existing default-device selection
 does not change.
 
 There is no automatic CPU fallback. Geometry construction uses Warp's native
 host SAH/median builders, and winding-number refit is explicitly host-backed.
-Other unsupported operations raise errors. Advanced tile math/sort,
-array-wide native utilities, textures, volumes, hash grids, sparse matrices, indexed arrays,
+:func:`warp.utils.array_scan`, :func:`warp.utils.radix_sort_pairs`, and
+:func:`warp.utils.segmented_sort_pairs` run on the device and can be captured in graphs.
+:func:`tile_sort <warp._src.lang.tile_sort>` also runs cooperatively on the device, including in captured
+graphs, with the same key types and generic value payloads as CUDA. Non-power-of-two
+tiles require padded local-memory workspace; exceeding the device budget raises an error.
+Other unsupported operations raise errors. Tile FFT, array-wide reductions and
+run-length encoding, textures, volumes, hash grids, sparse matrices, indexed arrays,
 external streams, DLPack, conditional graphs, and graph serialization are not
-supported yet. Tiled kernels require full work-groups; subgroup width is not
-assumed to be 32. Graph capture uses a single queue, requires serialized host
-access, and does not allow allocations or host transfers. Keep geometry owners
-alive until graphs referencing their IDs are released.
+supported yet. Events support single-stream capture; capturing several streams
+remains unsupported. Tiled kernels
+support partial logical blocks by submitting a smaller physical tail work-group.
+The requested block dimension and tile register layout are preserved; entries
+owned by absent logical lanes do not participate. Collective control flow must
+remain uniform among the physical work-items, and subgroup width is not assumed
+to be 32. Graph capture
+uses a single queue, requires serialized host access, and does not allow host
+transfers or event recording. Arrays allocated during capture remain valid until
+both their graph and user references are released. Storage is retained per captured
+allocation, not allocated again on each replay. Keep geometry owners alive until
+graphs referencing their IDs are released.
 
 .. _windows-arm64-builds:
 

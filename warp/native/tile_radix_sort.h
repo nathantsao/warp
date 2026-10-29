@@ -1004,6 +1004,111 @@ CUDA_CALLABLE_DEVICE void tile_sort(TileK& t, TileV& t2, int start, int length)
     WP_TILE_SYNC();
 }
 
+#elif defined(__SYCL_DEVICE_ONLY__)
+
+template <typename K> inline bool tile_sort_key_less(const K& a, const K& b) { return a < b; }
+
+inline bool tile_sort_key_less(float a, float b)
+{
+    const uint32_t a_bits = sycl::bit_cast<uint32_t>(a);
+    const uint32_t b_bits = sycl::bit_cast<uint32_t>(b);
+    const uint32_t a_mask = (0u - (a_bits >> 31)) | 0x80000000u;
+    const uint32_t b_mask = (0u - (b_bits >> 31)) | 0x80000000u;
+    return (a_bits ^ a_mask) < (b_bits ^ b_mask);
+}
+
+template <typename K, typename V, bool Padded>
+inline void bitonic_sort_pairs_pow2_length_sycl(K* keys, V* values, bool* valid, int length)
+{
+    const int active_count = sycl_tile_active_count();
+    for (int k = 2; k <= length; k <<= 1) {
+        for (int stride = k / 2; stride > 0; stride >>= 1) {
+            // Keep loop trip counts uniform across work-items before the collective barrier.
+            for (int base = 0; base < length; base += active_count) {
+                const int i = base + WP_TILE_THREAD_IDX;
+                const int swap_idx = i ^ stride;
+                if (i < length && swap_idx > i) {
+                    const bool ascending = (i & k) == 0;
+                    bool swap = ascending ? tile_sort_key_less(keys[swap_idx], keys[i])
+                                          : tile_sort_key_less(keys[i], keys[swap_idx]);
+                    if constexpr (Padded) {
+                        if (valid[i] != valid[swap_idx])
+                            swap = ascending ? !valid[i] : !valid[swap_idx];
+                    }
+                    if (swap) {
+                        K key = keys[i];
+                        V value = values[i];
+                        keys[i] = keys[swap_idx];
+                        values[i] = values[swap_idx];
+                        keys[swap_idx] = key;
+                        values[swap_idx] = value;
+                        if constexpr (Padded) {
+                            const bool was_valid = valid[i];
+                            valid[i] = valid[swap_idx];
+                            valid[swap_idx] = was_valid;
+                        }
+                    }
+                }
+            }
+            WP_TILE_SYNC();
+        }
+    }
+}
+
+template <int MaxElements, typename K, typename V>
+inline void bitonic_sort_thread_block_sycl(K* keys, V* values, int length)
+{
+    const int active_count = sycl_tile_active_count();
+    WP_TILE_SYNC();
+    if (is_power_of_two(length)) {
+        bitonic_sort_pairs_pow2_length_sycl<K, V, false>(keys, values, nullptr, length);
+    } else {
+        constexpr int scratch_count = next_higher_pow2(MaxElements);
+        K* keys_tmp = (K*)tile_shared_storage_t::alloc(int(sizeof(K) * scratch_count));
+        V* values_tmp = (V*)tile_shared_storage_t::alloc(int(sizeof(V) * scratch_count));
+        bool* valid = (bool*)tile_shared_storage_t::alloc(int(sizeof(bool) * scratch_count));
+        const int padded_length = next_higher_pow2(length);
+
+        for (int base = 0; base < padded_length; base += active_count) {
+            const int i = base + WP_TILE_THREAD_IDX;
+            if (i < padded_length) {
+                keys_tmp[i] = i < length ? keys[i] : K {};
+                values_tmp[i] = i < length ? values[i] : V {};
+                // Padding must not replace real maximum keys or floating-point special values.
+                valid[i] = i < length;
+            }
+        }
+        WP_TILE_SYNC();
+
+        bitonic_sort_pairs_pow2_length_sycl<K, V, true>(keys_tmp, values_tmp, valid, padded_length);
+
+        for (int base = 0; base < length; base += active_count) {
+            const int i = base + WP_TILE_THREAD_IDX;
+            if (i < length) {
+                keys[i] = keys_tmp[i];
+                values[i] = values_tmp[i];
+            }
+        }
+        WP_TILE_SYNC();
+
+        tile_shared_storage_t::alloc(-int(sizeof(bool) * scratch_count));
+        tile_shared_storage_t::alloc(-int(sizeof(V) * scratch_count));
+        tile_shared_storage_t::alloc(-int(sizeof(K) * scratch_count));
+    }
+}
+
+template <typename TileK, typename TileV> inline void tile_sort(TileK& t, TileV& t2)
+{
+    constexpr int num_elements_to_sort = TileK::Layout::Shape::size();
+    bitonic_sort_thread_block_sycl<num_elements_to_sort>(&t.data(0), &t2.data(0), num_elements_to_sort);
+}
+
+template <typename TileK, typename TileV> inline void tile_sort(TileK& t, TileV& t2, int start, int length)
+{
+    constexpr int max_elements_to_sort = TileK::Layout::Shape::size();
+    bitonic_sort_thread_block_sycl<max_elements_to_sort>(&t.data(start), &t2.data(start), length);
+}
+
 #else
 
 // CPU implementation
@@ -1294,7 +1399,7 @@ template <typename TileK, typename TileV> void tile_sort(TileK& t, TileV& t2, in
 }
 
 
-#endif  // !defined(__CUDA_ARCH__)
+#endif  // defined(__CUDA_ARCH__)
 
 
 template <typename TileK, typename TileV> inline void adj_tile_sort(TileK& t, TileV& t2, TileK& adj_t1, TileV& adj_t2)

@@ -647,9 +647,7 @@ def main(argv: list[str] | None = None) -> int:
                 build_llvm.build_warp_clang(args, lib_name("warp-clang"))
 
         if args.sycl:
-            from warp._src.build_sycl import build_runtime  # noqa: PLC0415
-
-            build_runtime(os.path.join(build_path, "bin", "warp-sycl.so"), args.mode)
+            build_dll.build_sycl_runtime(os.path.join(build_path, "bin", "warp-sycl.so"), args.mode)
 
     except Exception as e:
         print(f"Warp build error: {e}")

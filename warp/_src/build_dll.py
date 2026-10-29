@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 
+from warp._src.build import get_sycl_compiler, run_sycl_compiler
 from warp._src.build_architecture import Architecture, machine_architecture
 from warp._src.utils import ScopedTimer
 
@@ -1013,3 +1014,32 @@ def build_dll(args, dll_path, cpp_paths, cu_paths, libs=None):
         build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, "aarch64", libs)
     else:
         build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, machine_architecture(), libs)
+
+
+def build_sycl_runtime(output: str, mode: str = "release") -> None:
+    native = pathlib.Path(__file__).resolve().parents[1] / "native"
+    run_sycl_compiler(
+        [
+            get_sycl_compiler(),
+            "-fsycl",
+            "-std=c++17",
+            "-fPIC",
+            "-shared",
+            "-fvisibility=hidden",
+            "-DWP_BUILD_DLL",
+            *(() if mode == "debug" else ("-DNDEBUG",)),
+            "-O0" if mode == "debug" else "-O2",
+            str(native / "warp_sycl.cpp"),
+            str(native / "bvh_sycl.cpp"),
+            str(native / "mesh_sycl.cpp"),
+            str(native / "scan_sycl.cpp"),
+            str(native / "sort_sycl.cpp"),
+            "-L",
+            str(native.parent / "bin"),
+            "-l:warp.so",
+            "-lze_loader",
+            "-Wl,-rpath,$ORIGIN",
+            "-o",
+            output,
+        ]
+    )

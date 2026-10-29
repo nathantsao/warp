@@ -704,7 +704,7 @@ template <typename Tile, typename Op> auto tile_reduce_impl(Op f, Tile& t)
         // The redundant work is intentional: lane 0, or any sparse subset
         // of lanes, may already have returned from the logical block.
 #if defined(__SYCL_DEVICE_ONLY__)
-        has_data[tid] = false;
+        sycl_tile_clear_flags(has_data);
 #else
         for (int i = 0; i < WP_TILE_BLOCK_DIM; ++i)
             has_data[i] = false;
@@ -813,7 +813,7 @@ auto tile_reduce_axis_impl(Op f, Tile& t, typename Tile::Type empty_identity, bo
         // Do not elect lane 0 as the initializer because it may have
         // returned while the remaining fibers continue this block.
 #if defined(__SYCL_DEVICE_ONLY__)
-        active[tid] = false;
+        sycl_tile_clear_flags(active);
 #else
         for (int i = 0; i < WP_TILE_BLOCK_DIM; ++i)
             active[i] = false;
@@ -868,11 +868,19 @@ auto tile_reduce_axis_impl(Op f, Tile& t, typename Tile::Type empty_identity, bo
             } else if (has_empty_identity) {
                 output.data[r] = empty_identity;
             } else {
+#if defined(__SYCL_DEVICE_ONLY__)
+                printf(
+                    "Warp tile_reduce() axis slice has no active values and the reduction operator has no declared "
+                    "identity\n"
+                );
+                __builtin_trap();
+#else
                 _wp_assert(
                     "Warp tile_reduce() axis slice has no active values and the reduction operator has no declared "
                     "identity",
                     __FILE__, (unsigned int)__LINE__
                 );
+#endif
                 output.data[r] = T {};
             }
         }
@@ -920,8 +928,12 @@ template <typename Tile, typename Op, typename OpTrack> auto tile_arg_reduce_imp
         // `tile_reduce_impl`. Without this, fibers that returned early in
         // the bounds-check thunk leave stale `true` flags and the combine
         // loop reads uninitialized scratch.
+#if defined(__SYCL_DEVICE_ONLY__)
+        sycl_tile_clear_flags(has_data);
+#else
         for (int i = 0; i < WP_TILE_BLOCK_DIM; ++i)
             has_data[i] = false;
+#endif
         WP_TILE_SYNC();
 
         // Local champion across this fiber's registers.
