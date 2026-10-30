@@ -264,6 +264,7 @@ class Function:
         require_original_output_arg: bool = False,
         scope_locals: dict[str, Any] | None = None,
         inline_hint: Literal["noinline", "forceinline"] | None = None,
+        inline_hint_overrides: dict[str, Literal["noinline", "forceinline"]] | None = None,
     ):
         if code_transformers is None:
             code_transformers = []
@@ -292,6 +293,7 @@ class Function:
         self.custom_grad_func: Function | None = None
         self.require_original_output_arg = require_original_output_arg
         self.inline_hint = inline_hint
+        self.inline_hint_overrides = {} if inline_hint_overrides is None else inline_hint_overrides.copy()
         self.generic_parent = None  # generic function that was used to instantiate this overload
 
         if initializer_list_func is None:
@@ -1492,6 +1494,7 @@ def func(
     name: str | None = None,
     module: Module | Literal["unique"] | str | None = None,
     inline: bool | None = None,
+    override: dict[Literal["cpu", "cuda", "sycl"], bool] | None = None,
 ) -> Callable[[Callable[_FuncParams, _FuncReturn]], Callable[_FuncParams, _FuncReturn]]:
     """Register a Warp function (decorator with arguments: ``@wp.func(...)``)."""
     ...
@@ -1503,6 +1506,7 @@ def func(
     name: str | None = None,
     module: Module | Literal["unique"] | str | None = None,
     inline: bool | None = None,
+    override: dict[Literal["cpu", "cuda", "sycl"], bool] | None = None,
 ):
     """Decorator to define a Warp function callable from kernels and other Warp functions.
 
@@ -1518,9 +1522,14 @@ def func(
             inlining (CUDA ``__forceinline__``), overriding the compiler's own
             heuristic. ``False`` keeps the function out of line (CUDA
             ``__noinline__``).
+        override: Backend-specific inline settings that take precedence over
+            ``inline``. Keys are ``"cpu"``, ``"cuda"`` or ``"sycl"``, not device
+            ordinals. Unlisted backends use ``inline``. For example,
+            ``override={"sycl": False}`` prevents inlining on SYCL while leaving
+            the choice to the compiler on other backends.
 
     The inline hint covers the generated adjoint as well as the forward function, and is
-    lowered per backend so the decorated function stays valid for CPU and CUDA.
+    lowered per backend so the decorated function stays valid for CPU, CUDA and SYCL.
 
     See also:
         :func:`warp.kernel` for defining kernels that can be launched on devices.
@@ -1530,6 +1539,18 @@ def func(
         raise TypeError(f"inline must be a bool or None, got {type(inline).__name__}: {inline!r}")
 
     inline_hint = None if inline is None else ("forceinline" if inline else "noinline")
+    inline_hint_overrides: dict[str, Literal["noinline", "forceinline"]] = {}
+    if override is not None:
+        if not isinstance(override, dict):
+            raise TypeError(f"override must be a dict or None, got {type(override).__name__}: {override!r}")
+        for backend, value in override.items():
+            if backend not in ("cpu", "cuda", "sycl"):
+                raise ValueError(f"Unknown inline override backend {backend!r}; expected 'cpu', 'cuda' or 'sycl'")
+            if not isinstance(value, bool):
+                raise TypeError(
+                    f"inline override for {backend!r} must be a bool, got {type(value).__name__}: {value!r}"
+                )
+            inline_hint_overrides[backend] = "forceinline" if value else "noinline"
 
     frame = inspect.currentframe()
     if frame is None or frame.f_back is None:
@@ -1562,6 +1583,7 @@ def func(
             scope_locals=scope_locals,
             doc=doc.strip(),
             inline_hint=inline_hint,
+            inline_hint_overrides=inline_hint_overrides,
         )  # value_type not known yet, will be inferred during Adjoint.build()
 
         # use the top of the list of overloads for this key
@@ -1768,6 +1790,7 @@ def func_grad(forward_fn):
                 skip_adding_overload=False,
                 code_transformers=f.adj.transformers,
                 inline_hint=f.inline_hint,
+                inline_hint_overrides=f.inline_hint_overrides,
             )
             f.adj.skip_reverse_codegen = True
 
@@ -1846,6 +1869,7 @@ def func_replay(forward_fn):
             skip_adding_overload=True,
             code_transformers=f.adj.transformers,
             inline_hint=f.inline_hint,
+            inline_hint_overrides=f.inline_hint_overrides,
         )
         return replay_fn
 
@@ -3257,9 +3281,11 @@ class ModuleHasher:
             if ovl.adj_native_snippet:
                 ch.update(bytes(ovl.adj_native_snippet, "utf-8"))
 
-            # the inline hint changes the generated C++/CUDA, so it belongs in the cache key
+            # Inline hints change the generated source, so they belong in the cache key.
             if ovl.inline_hint:
                 ch.update(bytes(ovl.inline_hint, "utf-8"))
+            for backend, hint in sorted(ovl.inline_hint_overrides.items()):
+                ch.update(f"inline:{backend}:{hint}".encode())
 
         h = ch.digest()
 
@@ -3663,7 +3689,7 @@ class ModuleBuilder:
                     options=self.options,
                     forward_only=forward_only,
                     reverse_only=reverse_only,
-                    inline_hint=func.inline_hint,
+                    inline_hint=func.inline_hint_overrides.get(device, func.inline_hint),
                 )
             else:
                 source += warp._src.codegen.codegen_snippet(
@@ -8823,9 +8849,8 @@ class Runtime:
         self.sycl_devices = []
         sycl_lib = os.path.join(bin_path, "warp-sycl.so")
         if sys.platform == "linux" and os.path.isfile(sycl_lib):
-            from warp._src.sycl import check, configure_environment, register_functions  # noqa: PLC0415
+            from warp._src.sycl import check, register_functions  # noqa: PLC0415
 
-            configure_environment()
             self.sycl = self.load_dll(sycl_lib)
             register_functions(self.sycl)
             _verify_library_version(self.sycl, "warp-sycl", "wp_sycl_version", warp.config.version)

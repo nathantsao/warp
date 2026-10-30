@@ -330,6 +330,12 @@ Function-level settings can be passed as arguments to the :func:`@wp.func <warp.
        choice to the backend compiler. ``True`` requires inlining (CUDA
        ``__forceinline__``), overriding the compiler's own heuristic. ``False``
        keeps the function out of line (CUDA ``__noinline__``).
+   * - ``override``
+     - dict[str, Boolean] | ``None``
+     - ``None``
+     - Backend-specific inline settings that take precedence over ``inline``.
+       Keys are ``"cpu"``, ``"cuda"`` or ``"sycl"``, not device ordinals such as
+       ``"sycl:0"``. Unlisted backends use ``inline``.
 
 .. code-block:: python
 
@@ -344,12 +350,23 @@ Function-level settings can be passed as arguments to the :func:`@wp.func <warp.
         # inlined even where the backend compiler would not choose to
         return x * 2.0
 
+
+    @wp.func(override={"sycl": False})
+    def backend_specific_helper(x: float) -> float:
+        return x * x
+
+
 By default, the backend compiler decides whether to inline a function at each call site. Set
 ``inline=False`` to prevent inlining or ``inline=True`` to require it.
+Use ``override={"sycl": False}`` to prevent inlining only on SYCL, leaving CPU and CUDA
+compiler-chosen. Overrides specify explicit Boolean values, not an inversion of ``inline``:
+``inline=True, override={"sycl": False}`` requires inlining on CPU and CUDA but prevents it
+on SYCL.
 
 Inlining duplicates the function body at each call site. This can increase register pressure and
 instruction-cache use. Keeping a function out of line avoids that duplication but adds
 function-call overhead. The best choice depends on the workload, so measure both options.
 
 The hint covers the generated adjoint as well as the forward function, and is lowered per
-backend, so the same function remains valid for CPU and CUDA.
+backend, so the same function remains valid for CPU, CUDA and SYCL. Backend overrides also
+apply to custom gradient and replay functions.

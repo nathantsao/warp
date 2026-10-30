@@ -5,7 +5,6 @@ import ctypes
 import faulthandler
 import gc
 import hashlib
-import os
 import subprocess
 import tempfile
 import unittest
@@ -18,13 +17,14 @@ import numpy as np
 import warp as wp
 from warp._src import build
 from warp._src.context import _is_graph_capture_allocation_enabled, _is_graph_capture_allocation_supported
-from warp._src.sycl import check, configure_environment
+from warp._src.sycl import check
 from warp._src.types import tile
+from warp.tests import test_func_inline as inline_tests
 from warp.tests import test_graph as graph_tests
 from warp.tests import test_reload as reload_tests
 from warp.tests import test_utils as utils_tests
 from warp.tests.tile import test_tile_sort as tile_sort_tests
-from warp.tests.unittest_utils import add_function_test, run_test_in_subprocess
+from warp.tests.unittest_utils import add_function_test, run_python_subprocess, run_test_in_subprocess
 
 
 @wp.kernel
@@ -1937,19 +1937,29 @@ def test_sycl_tile_sort_graph_streams(test, device):
 
 
 class TestSycl(unittest.TestCase):
-    def test_sycl_environment_defaults(self):
-        with mock.patch.dict(os.environ):
-            os.environ.pop("IGC_DisableRecompilation", None)
-            configure_environment()
-            self.assertEqual(os.environ["IGC_DisableRecompilation"], "1")
-            configure_environment()
-            self.assertEqual(os.environ["IGC_DisableRecompilation"], "1")
+    def test_sycl_environment_unchanged(self):
+        """Leave the IGC retry environment unchanged during runtime initialization."""
+        for value in (None, "0", "1", ""):
+            with self.subTest(value=value):
+                result = run_python_subprocess(
+                    f"""
+import os
 
-    def test_sycl_environment_overrides(self):
-        for value in ("0", "1", ""):
-            with self.subTest(value=value), mock.patch.dict(os.environ, {"IGC_DisableRecompilation": value}):
-                configure_environment()
-                self.assertEqual(os.environ["IGC_DisableRecompilation"], value)
+expected = {value!r}
+if expected is None:
+    os.environ.pop("IGC_DisableRecompilation", None)
+else:
+    os.environ["IGC_DisableRecompilation"] = expected
+
+import warp as wp
+
+wp.init()
+actual = os.environ.get("IGC_DisableRecompilation")
+if actual != expected:
+    raise RuntimeError(f"IGC retry environment changed: {{expected!r}} -> {{actual!r}}")
+"""
+                )
+                self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
 
     def test_build_sycl(self):
         precise = ["-ffp-model=precise", "-foffload-fp32-prec-sqrt", "-foffload-fp32-prec-div"]
@@ -2087,6 +2097,7 @@ class TestSycl(unittest.TestCase):
 
 devices = [device for device in wp.get_devices() if device.is_sycl]
 add_function_test(TestSycl, "test_core", test_sycl_core, devices=devices)
+add_function_test(TestSycl, "test_inline_override", inline_tests.test_inline_override_func_runs, devices=devices)
 add_function_test(TestSycl, "test_atomics", test_sycl_atomics, devices=devices)
 add_function_test(TestSycl, "test_tiles", test_sycl_tiles, devices=devices)
 add_function_test(TestSycl, "test_partial_tiles", test_sycl_partial_tiles, devices=devices)

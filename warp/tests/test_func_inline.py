@@ -5,6 +5,7 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -16,6 +17,8 @@ from warp.tests.unittest_utils import add_function_test, assert_np_equal, get_te
 def module_source(kernel, device: str) -> str:
     """Generate the full module source, including @wp.func bodies, for a kernel's module."""
     options = kernel.module.resolve_options(wp.config) | kernel.options
+    if device == "sycl":
+        return kernel.module._run_codegen(options, is_cpu=False, is_sycl=True)[0]
     return ModuleBuilder(kernel.module, options).codegen(device)
 
 
@@ -37,6 +40,29 @@ def test_noinline_func_runs(test, device):
     assert_np_equal(values.numpy(), np.arange(128, dtype=np.float32) * 2.0)
 
 
+@wp.func(override={"sycl": False})
+def square_backend_hint(x: float) -> float:
+    return x * x
+
+
+@wp.kernel(module="unique")
+def apply_square_backend_hint(values: wp.array[float], output: wp.array[float]):
+    tid = wp.tid()
+    output[tid] = square_backend_hint(values[tid])
+
+
+def test_inline_override_func_runs(test, device):
+    """Run forward and backward kernels with a backend-specific inline hint."""
+    expected = np.arange(16, dtype=np.float32)
+    values = wp.array(expected, dtype=float, device=device, requires_grad=True)
+    output = wp.empty_like(values)
+    with wp.Tape() as tape:
+        wp.launch(apply_square_backend_hint, dim=values.shape, inputs=[values, output], device=device)
+    tape.backward(grads={output: wp.ones_like(output)})
+    assert_np_equal(output.numpy(), expected * expected)
+    assert_np_equal(values.grad.numpy(), expected * 2.0)
+
+
 class TestFuncInline(unittest.TestCase):
     def test_invalid_inline_hint_rejected(self):
         """Reject non-bool values for the inline hint."""
@@ -47,8 +73,43 @@ class TestFuncInline(unittest.TestCase):
                 def invalid(x: float) -> float:
                     return x
 
+    def test_invalid_inline_override_rejected(self):
+        """Reject invalid backend override containers, keys and values."""
+        for override in (False, [], "sycl"):
+            with self.subTest(override=override), self.assertRaisesRegex(TypeError, "override must be a dict"):
+
+                @wp.func(override=override, module="unique")
+                def invalid_container(x: float) -> float:
+                    return x
+
+        for backend in ("sycl:0", "vulkan", None):
+            with self.subTest(backend=backend), self.assertRaisesRegex(ValueError, "Unknown inline override backend"):
+
+                @wp.func(override={backend: False}, module="unique")
+                def invalid_backend(x: float) -> float:
+                    return x
+
+        for value in (None, 1, 1.5, "yes"):
+            with self.subTest(value=value), self.assertRaisesRegex(TypeError, "must be a bool"):
+
+                @wp.func(override={"sycl": value}, module="unique")
+                def invalid_value(x: float) -> float:
+                    return x
+
+    def test_inline_override_copied(self):
+        """Copy the override mapping so caller mutations do not change a registered function."""
+        override = {"sycl": False}
+
+        @wp.func(override=override, module="unique")
+        def helper(x: float) -> float:
+            return x
+
+        override["sycl"] = True
+        self.assertIsNone(helper.inline_hint)
+        self.assertEqual(helper.inline_hint_overrides, {"sycl": "noinline"})
+
     def test_codegen_emits_inline_attrs(self):
-        """Emit the requested inline attribute for CPU and CUDA, and nothing when none is requested."""
+        """Emit the requested inline attribute for each backend, and nothing when none is requested."""
         for inline, macro in ((None, None), (False, "WP_NOINLINE"), (True, "WP_FORCEINLINE")):
 
             @wp.func(inline=inline, module="unique")
@@ -59,13 +120,142 @@ class TestFuncInline(unittest.TestCase):
             def uses_helper(a: wp.array[float]):
                 a[wp.tid()] = helper(1.0)
 
-            for device in ("cpu", "cuda"):
+            for device in ("cpu", "cuda", "sycl"):
                 with self.subTest(device=device, inline=inline):
                     # NOTE: match on each macro's use, not its name -- the module header
                     # #defines both regardless of whether any function requested them.
                     source = module_source(uses_helper, device)
                     emitted = [m for m in ("WP_NOINLINE", "WP_FORCEINLINE") if f"static {m} " in source]
                     self.assertEqual(emitted, [macro] if macro else [])
+
+    def test_codegen_emits_inline_overrides(self):
+        """Apply backend overrides before the default hint without affecting unlisted backends."""
+        cases = (
+            (None, {"sycl": False}),
+            (None, {"cpu": True}),
+            (False, {"sycl": True}),
+            (True, {"cuda": False, "sycl": False}),
+            (None, {}),
+        )
+        for inline, override in cases:
+
+            @wp.func(inline=inline, override=override, module="unique")
+            def helper(x: float) -> float:
+                return x + 1.0
+
+            @wp.kernel(enable_backward=False, module=helper.module)
+            def uses_helper(a: wp.array[float]):
+                a[wp.tid()] = helper(1.0)
+
+            for device in ("cpu", "cuda", "sycl"):
+                with self.subTest(device=device, inline=inline, override=override):
+                    source = module_source(uses_helper, device)
+                    hint = override.get(device, inline)
+                    macro = None if hint is None else ("WP_FORCEINLINE" if hint else "WP_NOINLINE")
+                    emitted = [m for m in ("WP_NOINLINE", "WP_FORCEINLINE") if f"static {m} " in source]
+                    self.assertEqual(emitted, [macro] if macro else [])
+
+    def test_inline_override_cache_hash(self):
+        """Hash override values and backends while ignoring mapping insertion order."""
+
+        def function_hash(inline=None, override=None):
+            @wp.func(inline=inline, override=override, module="unique")
+            def helper(x: float) -> float:
+                return x + 1.0
+
+            @wp.kernel(enable_backward=False, module=helper.module)
+            def uses_helper(a: wp.array[float]):
+                a[wp.tid()] = helper(1.0)
+
+            return uses_helper.module.get_module_hash()
+
+        self.assertEqual(function_hash(), function_hash(override={}))
+        hashes = (
+            function_hash(),
+            function_hash(override={"sycl": False}),
+            function_hash(override={"sycl": True}),
+            function_hash(override={"cuda": False}),
+            function_hash(inline=True, override={"sycl": False}),
+        )
+        self.assertEqual(len(set(hashes)), len(hashes))
+        self.assertEqual(
+            function_hash(override={"sycl": False, "cpu": True}),
+            function_hash(override={"cpu": True, "sycl": False}),
+        )
+
+    def test_inline_override_applied_to_generic(self):
+        """Preserve overrides when a generic function is instantiated."""
+
+        @wp.func(override={"sycl": False}, module="unique")
+        def generic(x: Any):
+            return x * x
+
+        @wp.kernel(enable_backward=False, module="unique")
+        def uses_generic(a: wp.array[float]):
+            a[wp.tid()] = generic(2.0)
+
+        for device in ("cpu", "cuda", "sycl"):
+            with self.subTest(device=device):
+                source = module_source(uses_generic, device)
+                self.assertEqual("static WP_NOINLINE " in source, device == "sycl")
+
+    def test_inline_override_applied_to_adjoint(self):
+        """Resolve the default and override for both forward and adjoint definitions."""
+
+        @wp.func(inline=True, override={"sycl": False}, module="unique")
+        def differentiable(x: float) -> float:
+            return x * x
+
+        @wp.kernel(enable_backward=True, module="unique")
+        def uses_differentiable(a: wp.array[float]):
+            a[wp.tid()] = differentiable(2.0)
+
+        for device in ("cpu", "cuda", "sycl"):
+            with self.subTest(device=device):
+                source = module_source(uses_differentiable, device)
+                macro = "WP_NOINLINE" if device == "sycl" else "WP_FORCEINLINE"
+                for name in (differentiable.native_func, f"adj_{differentiable.native_func}"):
+                    definitions = [
+                        line for line in source.splitlines() if line.startswith("static") and f" {name}(" in line
+                    ]
+                    self.assertEqual(len(definitions), 1)
+                    self.assertIn(macro, definitions[0])
+
+    def test_inline_override_applied_to_custom_grad_and_replay(self):
+        """Propagate backend overrides to custom gradient and replay functions."""
+
+        @wp.func(override={"sycl": False}, module="unique")
+        def squared(x: float) -> float:
+            return x * x
+
+        @wp.func_grad(squared)
+        def adj_squared(x: float, adj_ret: float):
+            wp.adjoint[x] += 2.0 * x * adj_ret
+
+        @wp.func_replay(squared)
+        def replay_squared(x: float):
+            return x * x
+
+        @wp.kernel(enable_backward=True, module="unique")
+        def uses_squared(a: wp.array[float]):
+            a[wp.tid()] = squared(3.0)
+
+        self.assertEqual(squared.custom_grad_func.inline_hint_overrides, {"sycl": "noinline"})
+        self.assertEqual(squared.custom_replay_func.inline_hint_overrides, {"sycl": "noinline"})
+        for device in ("cpu", "cuda", "sycl"):
+            with self.subTest(device=device):
+                source = module_source(uses_squared, device)
+                names = (
+                    squared.native_func,
+                    f"adj_{squared.native_func}",
+                    squared.custom_replay_func.native_func,
+                )
+                for name in names:
+                    definitions = [
+                        line for line in source.splitlines() if line.startswith("static") and f" {name}(" in line
+                    ]
+                    self.assertEqual(len(definitions), 1)
+                    self.assertEqual("WP_NOINLINE" in definitions[0], device == "sycl", definitions[0])
 
     def test_inline_attr_applied_to_adjoint(self):
         """Apply the inline attribute to the generated adjoint as well as the forward function."""
@@ -209,6 +399,7 @@ class TestFuncInline(unittest.TestCase):
 
 devices = get_test_devices()
 add_function_test(TestFuncInline, "test_noinline_func_runs", test_noinline_func_runs, devices=devices)
+add_function_test(TestFuncInline, "test_inline_override_func_runs", test_inline_override_func_runs, devices=devices)
 
 
 if __name__ == "__main__":

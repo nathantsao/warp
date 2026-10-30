@@ -41,7 +41,7 @@ reference, not a source-compatible patch for this version.
 | Preserve oneAPI adapter selection and expose `Device.supports_graph_capture`, `Device.is_graph_capture_event_supported` and `Device.is_conditional_graph_supported`. | Ordinary graph support is independent of captured timing and conditional control flow. Query each capability instead of assuming it from a backend name; retain ordinary capture on other devices/adapters and reject unsupported timing operations explicitly. |
 | Pass kernel arguments larger than the 2048-byte parameter limit through USM staging memory. | Large Warp kernels (e.g. MuJoCo Warp collision and constraint kernels) exceed the hardware limit; graph-captured launches own a private copy. |
 | Compile modules with `-ffp-model=precise` and correctly-rounded `sqrt` and division unless `fast_math` is set; define `NDEBUG` in release mode. | `icpx` defaults to a fast floating-point model (about 1e-4 relative error in `sin`, `cos` and `tan`, inexact `sqrt` and division) and, without `NDEBUG`, release kernels carry the debug-only tile bounds checks and device asserts. CPU and CUDA builds use IEEE semantics and `NDEBUG`. |
-| Default `IGC_DisableRecompilation=1` before loading the optional SYCL runtime, preserving explicit overrides. | Avoid the IGC 2.40.13 retry-stage CCD failures without changing collision algorithms, numerical tolerances or ordinary optimization. This temporary compiler workaround is process-wide and may retain more register spills; remove it after a verified fix. |
+| Keep `inline` as the default function hint and accept explicit backend overrides; MJWarp uses `override={"sycl": False}` for polygon clipping. | Avoid the observed IGC 2.40.13 CCD failure without changing collision math, CPU/CUDA inlining or process-wide compiler settings. The previous global retry-disabled default regressed 23 box-box cases and has been removed. |
 | Compute the shared (local) memory requirement of a module from the deepest kernel plus the largest transient tile scratch, and report device compute units and memory. | Summing every function overestimated local memory and rejected valid modules. `sm_count`, `free_memory` and `total_memory` now report real values. |
 | Implement `array_scan`, `radix_sort_pairs` and `segmented_sort_pairs` as native SYCL kernels on the current stream, with per-stream scratch that a graph takes ownership of during capture. | Public Warp utilities that MJWarp calls every step. Library implementations (oneDPL) block and allocate internally, which breaks asynchronous ordering and graph capture. |
 | Implement `tile_sort` with work-group bitonic compare-exchanges over the existing local-memory arena and barriers. | Preserve CUDA's in-place key/value contract without assuming 32-lane subgroups, adding host work, or forking MJWarp's tiled SAP and contact-sensor kernels. |
@@ -368,8 +368,9 @@ before performance.
    read during asynchronous refit without synchronizing every refit. Existing
    rendering regressions and changing-input forward/refit/render capture pass
    through 4096 worlds. This does not resolve the physics issues in steps 5 and 6.
-5. **Optimized multi-contact CCD correctness.** *Mitigated by a temporary default;
-   the permanent fix remains open.* With IGC retry enabled, seven cases fail:
+5. **Optimized multi-contact CCD correctness.** *Mitigated by a targeted SYCL
+   noinline hint; the permanent compiler fix remains open.* Without the hint,
+   normal IGC retry fails seven cases:
    four capsule-mesh and three cylinder contact tests. The capsule-mesh path
    (`test_capsule_mesh_multiccd_*`) gives wrong results at default optimization. Earlier probes passed with
    `icpx -O0`, with `-fno-inline-functions`, with the device compiler's optimizer disabled
@@ -386,15 +387,19 @@ before performance.
    with runtime bounds, 2D array views, a divergent outer grid-stride loop, and an
    out-of-line function, so the failing compiler context and responsible pass have
    not yet been minimized. This establishes a compiler-stage error on the traced
-   path, not a common root cause for every cylinder case. Warp now defaults
-   `IGC_DisableRecompilation=1` before loading the optional SYCL library, unless the
-   caller supplies a value. All 11 selected capsule-mesh/cylinder cases pass with
-   this default and normal caches. Frontend `-O3` and the large-register-file
-   backend option did not resolve the failures with retry enabled.
-   The default skips IGC's retry stage, not ordinary release optimization or
-   caching, and can affect other Intel GPU libraries in the process. A TODO in
-   [the environment setup](../warp/_src/sycl.py) tracks minimization and removal
-   after a verified fix. Keep the existing tests enabled and do not relax
+   path, not a common root cause for every cylinder case or proof that
+   Warp-generated C++ is free of undefined behavior. The initial process-wide
+   `IGC_DisableRecompilation=1` default passed all 11 selected CCD cases but
+   introduced 23 box-box failures. Fresh-compilation controls confirm the
+   tradeoff, so Warp no longer sets that variable. Instead,
+   [MJWarp polygon clipping](../../mujoco_warp/mujoco_warp/_src/collision_gjk.py)
+   uses `@wp.func(override={"sycl": False})`. All 66 selected CCD and box-box
+   cases pass with normal IGC retry and persistent caches disabled. CPU and CUDA
+   retain compiler-chosen inlining. Frontend `-O3` and the large-register-file
+   backend option did not resolve the original CCD failures.
+   The hint changes an optimization boundary rather than fixing the compiler;
+   its performance impact is unmeasured. A TODO beside the helper tracks
+   minimization and removal after a verified fix. Keep the existing tests enabled and do not relax
    numerical checks or rewrite collision algorithms. Debug blocked Cholesky now runs
    successfully after the separate module-loading fixes.
 6. **Large-world line-search nondeterminism.** One of three identical 1024-world
@@ -548,51 +553,79 @@ At that baseline, the deselected `test_get_segmentation_preserves_flex_ids` was
 run separately on both CPU and SYCL and failed before GPU execution: the installed
 MuJoCo supplies two 12-value equality records where MJWarp expected vec11 records.
 No compatibility patch or permanent skip had been added. Those historical results
-do not include the equality compatibility fix or default IGC workaround below.
+do not include the equality compatibility fix or targeted CCD workaround below.
 
-### Equality compatibility and default IGC retry workaround
+### Equality compatibility and targeted CCD compiler workaround
 
 MJWarp now sizes equality records from `mujoco.mjNEQDATA` and preserves modern
 automatic weld-relative-pose semantics. The full BVH/ray/render-utility/render
 selection includes the previously failing flex segmentation case without
 deselection.
 
-Warp applies the temporary `IGC_DisableRecompilation=1` default before loading
-its optional SYCL runtime. Explicit values are preserved; setting it to `0`
-before initialization opts out when testing a fix. IGC reads its configuration
-once per process, so initialize Warp before other libraries compile Intel GPU
-kernels, or supply the variable in the launch environment. This is a process-wide
-compiler setting, not a per-module switch. It leaves release optimization and
-caching enabled, but may increase spills and reduce register-heavy kernel
-performance. No compiler, driver or system package was changed.
+The initial process-wide retry-disabled default was not a safe general
+workaround. The six-module physics run passed 842 cases, skipped 22 and failed
+51: 23 box-box cases plus 28 flex cases. The 23 box-box cases pass on CPU and
+with normal IGC retry, while disabling retry fails them even with persistent
+caches disabled. The same 28 flex case IDs fail in source CPU and unmodified
+installed CPU controls; two installed-package cases stop earlier at the old
+equality-record reshape instead of reaching the later source force assertions.
+These baseline distinctions must not be hidden with skips or relaxed tolerances.
 
-The following runs used the default workaround with no externally supplied
-`IGC_DisableRecompilation` and with `NEO_CACHE_PERSISTENT` and
-`SYCL_CACHE_PERSISTENT` unset, retaining normal cache behavior:
+Warp now leaves `IGC_DisableRecompilation` untouched. MJWarp requests noinline
+only for its SYCL polygon-clipping helper with
+`@wp.func(override={"sycl": False})`.
+
+`inline` remains the default Boolean/`None` hint. An explicit backend override
+takes precedence; unlisted backends use `inline`. Thus this helper remains
+compiler-chosen on CPU and CUDA. Overrides are validated, copied, included in
+stable cache hashes, and propagated to generic functions, adjoints and custom
+gradient/replay functions. See [function configuration](../docs/user_guide/configuration.rst).
+
+The current runs leave `IGC_DisableRecompilation` unset. The combined Warp and
+focused GPU collision runs disable persistent caches to exercise compilation;
+the CPU and broad SYCL runs use normal cache settings:
 
 | Suite | Result |
 |---|---|
-| Warp dedicated SYCL tests, including environment defaults and overrides | 92 passed, 1 adapter-specific negative test skipped |
-| MJWarp capsule-mesh/cylinder multi-contact CCD cases | 11 passed |
-| MJWarp eager/captured physics/reference checks at 1, 2, 64, 1024 and 4096 heterogeneous worlds, tracing on/off | 10 passed |
-| MJWarp BVH, rays, render utilities and rendering | 145 passed, no exclusions |
+| Combined Warp dedicated SYCL and function-inline suites | 107 passed, 3 skipped: one adapter-specific negative case and two CUDA-only PTX checks |
+| MJWarp capsule-mesh/cylinder CCD and box-box cases | 66 passed |
+| Full source CPU collision-driver suite | 201 passed, 2 skipped |
+| Nine-module SYCL physics/ray/render rerun with normal caches | 1001 passed, 22 skipped, 28 failed, plus 16 passed subtests |
+| Full SYCL collision-driver suite, included in the broad rerun | 201 passed, 2 skipped |
+| SYCL broadphase, ray, render-utility and render suites, included in the broad rerun | 171 passed, no exclusions |
+| Short eager/captured physics/reference cases at 1, 2, 64, 1024 and 4096 heterogeneous worlds, tracing on/off, included in the broad rerun | 10 passed |
 
-Fresh-process checks also preserve an explicit `IGC_DisableRecompilation=0`
-through real runtime initialization and leave it unset when the optional SYCL
-library is absent. The focused compiler tests retain the ordinary release/debug,
-math and optimization settings. These subsets overlap the complete dedicated
-Warp suite; their counts are not additive. Workaround performance has not yet
-been measured.
+The broad rerun's 28 failing case IDs exactly match the source CPU flex control;
+there are no additional failures. All 23 retry-disabled box-box regressions and
+the original seven CCD failures are absent. The render refit/capture cases also
+pass at 1, 2, 64, 1024 and 4096 worlds. Subset counts in this table overlap and
+must not be added together.
+
+Fresh-process checks verify that real Warp initialization does not set the IGC
+variable and preserves explicit `0`, `1` and empty-string settings. An explicit
+`1` can still reproduce the known box-box failure; leave it unset for normal
+retry. No compiler, driver or system package was changed, and the native Warp
+runtime was not rebuilt. Normal release/debug, math and optimization options
+remain intact. Performance of the noinline hint has not yet been measured.
 
 This is not a completed physics qualification. The captured physics/reference
 checks cover three steps, not long integration. In the separate 1000-step
-humanoid probe, both 1024-world repeats had finite state and zero raw overflow
-flags, but the second exceeded the existing `atol=rtol=5e-4` repeat comparison:
-maximum absolute differences were about `1.63e-3` in `qpos`, `1.36e-3` in `qvel`
-and `9.07e-3` in `qacc`. That run stopped before 4096 worlds. The cause remains
-uncharacterized and is separate from the historical line-search exhaustion.
-The underlying compiler issue still needs a minimized reproducer and a verified
-fix before removing the default.
+humanoid probe under the previous retry-disabled default, both 1024-world
+repeats had finite state and zero raw overflow flags, but the second exceeded
+the existing `atol=rtol=5e-4` repeat comparison: maximum absolute differences
+were about `1.54e-3` in `qpos`, `1.32e-3` in `qvel` and `1.02e-2` in `qacc`.
+Captured and eager traces first differ at step 1 despite equal input states
+and contact multisets. Constraint-row ordering and constraint forces differ;
+both first-differing-world outputs pass the unchanged one-step CPU tolerance.
+Comparing all active constraint inputs up to row permutation and checking every
+world against CPU remain pending before changing the long-run criterion.
+
+One separate historical 4096-world, 1000-step captured rollout was finite with
+all raw flags zero. It was one repeat, not ten, used the retry-disabled setting,
+and ran alongside other tests, so it is neither current-default long-run
+qualification nor a performance measurement. The historical line-search
+exhaustion remains a separate investigation. The underlying compiler issue
+still needs minimization and a verified fix before removing the noinline hint.
 
 MJWarp itself is the integration test: `pytest --device sycl:0 -n 24` in `mujoco_warp`.
 
