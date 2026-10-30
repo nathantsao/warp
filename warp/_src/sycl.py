@@ -2,12 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import ctypes
+import os
 
 from warp._src.types import array_t, float32, float64, int32, int64, uint32, uint64
 
 # Type codes shared with warp/native/warp_sycl.cpp (scan) and warp/native/sort_sycl.cpp (sort).
 SCAN_TYPES = {int32: 0, int64: 1, float32: 2, float64: 3}
 SORT_KEY_TYPES = {int32: 0, uint32: 1, float32: 2, int64: 3, uint64: 4, float64: 5}
+
+
+def configure_environment() -> None:
+    """Set SYCL compiler defaults without overriding the caller's environment."""
+    # TODO: Minimize the IGC 2.40.13 retry-stage CCD failure and remove this default after a verified fix.
+    os.environ.setdefault("IGC_DisableRecompilation", "1")
 
 
 def register_functions(library) -> None:

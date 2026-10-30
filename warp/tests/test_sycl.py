@@ -5,6 +5,7 @@ import ctypes
 import faulthandler
 import gc
 import hashlib
+import os
 import subprocess
 import tempfile
 import unittest
@@ -17,7 +18,7 @@ import numpy as np
 import warp as wp
 from warp._src import build
 from warp._src.context import _is_graph_capture_allocation_enabled, _is_graph_capture_allocation_supported
-from warp._src.sycl import check
+from warp._src.sycl import check, configure_environment
 from warp._src.types import tile
 from warp.tests import test_graph as graph_tests
 from warp.tests import test_reload as reload_tests
@@ -1936,6 +1937,20 @@ def test_sycl_tile_sort_graph_streams(test, device):
 
 
 class TestSycl(unittest.TestCase):
+    def test_sycl_environment_defaults(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("IGC_DisableRecompilation", None)
+            configure_environment()
+            self.assertEqual(os.environ["IGC_DisableRecompilation"], "1")
+            configure_environment()
+            self.assertEqual(os.environ["IGC_DisableRecompilation"], "1")
+
+    def test_sycl_environment_overrides(self):
+        for value in ("0", "1", ""):
+            with self.subTest(value=value), mock.patch.dict(os.environ, {"IGC_DisableRecompilation": value}):
+                configure_environment()
+                self.assertEqual(os.environ["IGC_DisableRecompilation"], value)
+
     def test_build_sycl(self):
         precise = ["-ffp-model=precise", "-foffload-fp32-prec-sqrt", "-foffload-fp32-prec-div"]
         cases = (

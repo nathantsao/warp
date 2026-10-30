@@ -8823,8 +8823,9 @@ class Runtime:
         self.sycl_devices = []
         sycl_lib = os.path.join(bin_path, "warp-sycl.so")
         if sys.platform == "linux" and os.path.isfile(sycl_lib):
-            from warp._src.sycl import check, register_functions  # noqa: PLC0415
+            from warp._src.sycl import check, configure_environment, register_functions  # noqa: PLC0415
 
+            configure_environment()
             self.sycl = self.load_dll(sycl_lib)
             register_functions(self.sycl)
             _verify_library_version(self.sycl, "warp-sycl", "wp_sycl_version", warp.config.version)
