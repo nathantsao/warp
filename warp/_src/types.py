@@ -3669,6 +3669,11 @@ class array(Array[DType, NDim]):
                 arr = data
             elif isinstance(data, (list, tuple)):
                 # construct from a sequence of structs
+                texture_device = warp._src.context.get_device(device)
+                if texture_device.is_sycl:
+                    from warp._src.sycl import texture_array_refs  # noqa: PLC0415
+
+                    self._texture_refs = texture_array_refs(data, texture_device)
                 try:
                     # convert each struct instance to its corresponding ctype
                     ctype_list = [v.__ctype__() for v in data]
@@ -3688,6 +3693,11 @@ class array(Array[DType, NDim]):
             # texture types (Texture2D, Texture3D) have _wp_ctype_ pointing to their ctypes struct
             if isinstance(data, (list, tuple)):
                 # construct from a sequence of textures
+                texture_device = warp._src.context.get_device(device)
+                if texture_device.is_sycl:
+                    if any(not isinstance(value, dtype) or value.device != texture_device for value in data):
+                        raise ValueError("SYCL texture arrays require textures on the array's device")
+                    self._texture_refs = tuple(data)
                 try:
                     # convert each texture instance to its corresponding ctype
                     ctype_list = [v.__ctype__() for v in data]

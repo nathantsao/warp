@@ -10957,6 +10957,13 @@ def event_from_ipc_handle(handle, device: DeviceLike = None) -> Event:
 def pack_arg(kernel, arg_type, arg_name, value, device, adjoint=False):
     device = runtime.get_device(device)
 
+    if (
+        isinstance(value, (Texture1D, Texture2D, Texture3D))
+        and (device.is_sycl or value.device.is_sycl)
+        and value.device != device
+    ):
+        raise RuntimeError(f"SYCL texture argument '{arg_name}' must reside on the launch device")
+
     if warp._src.types.is_array(arg_type):
         if device.is_sycl and not warp._src.types.matches_array_class(arg_type, warp.array):
             raise NotImplementedError("SYCL kernels currently require regular Warp arrays")
@@ -11084,9 +11091,16 @@ def pack_arg(kernel, arg_type, arg_name, value, device, adjoint=False):
             )
         for name, var in arg_type.vars.items():
             member = getattr(value, name)
-            if isinstance(var.type, warp._src.codegen.Struct) or (
-                warp._src.types.is_array(var.type)
-                and (device.is_sycl or (member is not None and member.device.is_sycl))
+            if (
+                isinstance(var.type, warp._src.codegen.Struct)
+                or (
+                    warp._src.types.is_array(var.type)
+                    and (device.is_sycl or (member is not None and member.device.is_sycl))
+                )
+                or (
+                    var.type in (Texture1D, Texture2D, Texture3D)
+                    and (device.is_sycl or (member is not None and member.device.is_sycl))
+                )
             ):
                 pack_arg(kernel, var.type, f"{arg_name}.{name}", member, device, adjoint)
         return value.__ctype__()
@@ -12149,6 +12163,8 @@ def launch(
 
         # run kernel
         elif device.is_sycl:
+            from warp._src.sycl import retain_arrays  # noqa: PLC0415
+
             if block_dim > device.max_work_group_size:
                 raise ValueError(f"block_dim={block_dim} exceeds the SYCL device work-group limit")
             if record_cmd:
@@ -12156,7 +12172,7 @@ def launch(
             if device.is_capturing:
                 graph = device.captures[None]
                 graph._retain_module_exec(module_exec)
-                graph._sycl_refs.extend((*fwd_args, *adj_args))
+                retain_arrays(device, *fwd_args, *adj_args)
             if stream is not None and stream is not device.stream:
                 # the native launch uses the device's current stream
                 previous_stream = device.stream
@@ -14865,6 +14881,14 @@ def copy(
             raise RuntimeError("Copy source and destination must have the same element size")
         if src_offset + count > src.size or dest_offset + count > dest.size:
             raise RuntimeError("SYCL copy exceeds source or destination bounds")
+        if dest.dtype in (Texture1D, Texture2D, Texture3D) or isinstance(dest.dtype, warp._src.codegen.Struct):
+            owner = src
+            while warp._src.types.is_array(owner):
+                refs = getattr(owner, "_texture_refs", ())
+                if refs:
+                    dest._texture_refs = tuple(dict.fromkeys((*getattr(dest, "_texture_refs", ()), *refs)))
+                    break
+                owner = getattr(owner, "_ref", None)
         device = src.device if src.device.is_sycl else dest.device
         if device.is_capturing:
             device.captures[None]._sycl_refs.extend((src, dest))

@@ -76,6 +76,9 @@ def register_functions(library) -> None:
         "mesh_refit": (integer, [identifier]),
         "mesh_set_points": (integer, [identifier, array_t]),
         "mesh_set_velocities": (integer, [identifier, array_t]),
+        "texture_create": (identifier, [ptr, integer, integer, integer, integer, integer, integer, integer, integer]),
+        "texture_destroy": (integer, [ptr, identifier]),
+        "texture_copy": (integer, [ptr, identifier, ptr, identifier, ptr, integer]),
     }
     for name, (restype, argtypes) in signatures.items():
         function = getattr(library, f"wp_sycl_{name}")
@@ -88,9 +91,28 @@ def check(library, result: int) -> None:
         raise RuntimeError(f"Warp SYCL error: {library.wp_sycl_get_error_string().decode('utf-8')}")
 
 
+def _resource_refs(value):
+    from warp._src.codegen import StructInstance  # noqa: PLC0415
+
+    if value is not None:
+        yield value
+        if isinstance(value, StructInstance):
+            for name in value._cls.vars:
+                yield from _resource_refs(getattr(value, name))
+
+
+def texture_array_refs(values, device):
+    from warp._src.texture import Texture  # noqa: PLC0415
+
+    refs = tuple(dict.fromkeys(ref for value in values for ref in _resource_refs(value) if isinstance(ref, Texture)))
+    if any(ref.device != device for ref in refs):
+        raise ValueError("SYCL texture arrays require textures on the array's device")
+    return refs
+
+
 def retain_arrays(device, *arrays) -> None:
     if device.is_capturing:
-        device.captures[None]._sycl_refs.extend(array for array in arrays if array is not None)
+        device.captures[None]._sycl_refs.extend(ref for value in arrays for ref in _resource_refs(value))
 
 
 class SyclAllocator:

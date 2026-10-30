@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <new>
 #include <stdexcept>
 #include <vector>
@@ -85,6 +86,8 @@ WP_API int wp_sycl_graph_memory_info(void* device, size_t* allocations, size_t* 
 #endif
 
 namespace wp {
+
+void sycl_defer_resource(void* device, std::shared_ptr<void> resource);
 
 inline void* sycl_stage_args(void* device, const void* src, size_t size)
 {

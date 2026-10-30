@@ -2870,7 +2870,7 @@ class Adjoint:
         )
         if adj.builder is not None and adj.builder.options.get("target_backend") == "sycl":
             if func.is_builtin() and (
-                func.key.startswith(("volume_", "hash_grid_", "texture_"))
+                func.key.startswith(("volume_", "hash_grid_"))
                 or func.key
                 in (
                     "tile_fft",
@@ -2878,6 +2878,11 @@ class Adjoint:
                 )
             ):
                 raise WarpCodegenError(f"{func.key}() is not yet supported on SYCL")
+            if func.is_builtin() and func.key.startswith("texture_"):
+                from warp._src.texture import Texture2D  # noqa: PLC0415
+
+                if func.key != "texture_sample" or strip_reference(bound_args["tex"].type) is not Texture2D:
+                    raise WarpCodegenError("SYCL texture sampling currently supports only Texture2D")
 
         def return_value(output):
             if return_resolved:
@@ -8614,7 +8619,7 @@ def codegen_sycl_module(kernel, options):
     name = kernel.get_mangled_name()
     tile_init = "                wp::tile_shared_storage_t tile_storage;\n" if uses_tiles else ""
     tile_sort_validate = (
-        f'        if (dim.size % {options["block_dim"]} != 0)\n'
+        f"        if (dim.size % {options['block_dim']} != 0)\n"
         '            throw std::runtime_error("SYCL tile_sort launches require complete work-groups");\n'
         if uses_tile_sort
         else ""

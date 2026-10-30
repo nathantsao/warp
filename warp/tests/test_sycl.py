@@ -37,6 +37,31 @@ def sycl_sum(x: wp.array[float], result: wp.array[float]):
     wp.atomic_add(result, 0, x[wp.tid()])
 
 
+@wp.kernel(module="unique", enable_backward=False)
+def sycl_texture_sample(
+    texture: wp.Texture2D,
+    coordinates: wp.array[wp.vec2],
+    scalar: wp.array[float],
+    pair: wp.array[wp.vec2],
+    rgba: wp.array[wp.vec4],
+):
+    i = wp.tid()
+    uv = coordinates[i]
+    scalar[i] = wp.texture_sample(texture, uv, dtype=float)
+    pair[i] = wp.texture_sample(texture, uv[0], uv[1], dtype=wp.vec2)
+    rgba[i] = wp.texture_sample(texture, uv, dtype=wp.vec4, lod=2.5)
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def sycl_texture_array_sample(
+    textures: wp.array[wp.Texture2D],
+    selectors: wp.array[int],
+    output: wp.array[wp.vec4],
+):
+    i = wp.tid()
+    output[i] = wp.texture_sample(textures[selectors[i]], wp.vec2(0.5), dtype=wp.vec4)
+
+
 @wp.kernel(module="unique")
 def sycl_atomic_types(
     small: wp.array[wp.float16],
@@ -54,6 +79,26 @@ def sycl_atomic_types(
 @wp.struct
 class SyclArrayStruct:
     values: wp.array[float]
+
+
+@wp.struct
+class SyclTextureStruct:
+    texture: wp.Texture2D
+
+
+@wp.struct
+class SyclNestedTextureStruct:
+    value: SyclTextureStruct
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def sycl_texture_struct_sample(
+    value: SyclNestedTextureStruct,
+    entries: wp.array[SyclTextureStruct],
+    output: wp.array[wp.vec4],
+):
+    output[0] = wp.texture_sample(value.value.texture, wp.vec2(0.5), dtype=wp.vec4)
+    output[1] = wp.texture_sample(entries[0].texture, wp.vec2(0.5), dtype=wp.vec4)
 
 
 SyclArgumentPadding = wp.types.vector(length=512, dtype=wp.float32)
@@ -900,6 +945,229 @@ def test_sycl_strides(test, device):
     view.fill_(7.0)
     values[:, ::2] = 7.0
     np.testing.assert_array_equal(x.numpy(), values)
+
+
+def test_sycl_textures(test, device):
+    pixels = np.arange(16, dtype=np.float32).reshape(2, 2, 4) / 16.0
+    coordinates = np.array(
+        [[0.25, 0.25], [0.75, 0.75], [0.5, 0.5], [-0.25, 0.25], [1.25, 0.75], [0.0, 0.0], [1.0, 1.0]],
+        dtype=np.float32,
+    )
+    for normalized in (False, True):
+        modes = (
+            tuple(wp.TextureAddressMode) if normalized else (wp.TextureAddressMode.CLAMP, wp.TextureAddressMode.BORDER)
+        )
+        for filtering in wp.TextureFilterMode:
+            for mode in modes:
+                with test.subTest(normalized=normalized, filtering=filtering, mode=mode):
+                    outputs = []
+                    for target in ("cpu", device):
+                        texture = wp.Texture2D(
+                            pixels,
+                            device=target,
+                            filter_mode=filtering,
+                            address_mode=mode,
+                            normalized_coords=normalized,
+                        )
+                        uv = wp.array(coordinates if normalized else coordinates * 2.0, dtype=wp.vec2, device=target)
+                        arrays = [
+                            wp.empty(len(coordinates), dtype=dtype, device=target)
+                            for dtype in (float, wp.vec2, wp.vec4)
+                        ]
+                        wp.launch(sycl_texture_sample, len(coordinates), inputs=[texture, uv, *arrays], device=target)
+                        outputs.append([value.numpy().copy() for value in arrays])
+                    expected = outputs[0]
+                    if mode == wp.TextureAddressMode.WRAP and filtering == wp.TextureFilterMode.CLOSEST:
+                        # CPU nearest-wrap clamps the rounded seam index; hardware wraps it to zero.
+                        rgba = pixels[[0, 1, 1, 0, 1, 0, 0], [0, 1, 1, 1, 0, 0, 0]]
+                        expected = [rgba[:, 0], rgba[:, :2], rgba]
+                    for actual, reference in zip(outputs[1], expected, strict=True):
+                        np.testing.assert_allclose(actual, reference, rtol=1e-5, atol=1e-5)
+    arrays = [wp.empty(len(coordinates), dtype=dtype, device=device) for dtype in (float, wp.vec2, wp.vec4)]
+    uv = wp.array(coordinates, dtype=wp.vec2, device=device)
+    wp.launch(sycl_texture_sample, len(coordinates), inputs=[None, uv, *arrays], device=device)
+    for value in arrays:
+        np.testing.assert_array_equal(value.numpy(), 0.0)
+
+
+def test_sycl_texture_copies(test, device):
+    pixels = np.arange(48, dtype=np.float32).reshape(3, 4, 4)
+    texture = wp.Texture2D(pixels, device=device)
+    output = np.empty_like(pixels)
+    texture.copy_to(output)
+    np.testing.assert_array_equal(output, pixels)
+    source = wp.array(pixels * 2.0, device=device)
+    texture.copy_from(source)
+    target = wp.empty_like(source)
+    texture.copy_to(target)
+    np.testing.assert_array_equal(target.numpy(), pixels * 2.0)
+    host = wp.Texture2D(pixels, device="cpu")
+    host.copy_from(texture)
+    host.copy_to(output)
+    np.testing.assert_array_equal(output, pixels * 2.0)
+    host.copy_from(pixels * 3.0)
+    host.copy_to(texture)
+    texture.copy_to(output)
+    np.testing.assert_array_equal(output, pixels * 3.0)
+    other = wp.Texture2D(width=4, height=3, num_channels=4, dtype=wp.float32, device=device)
+    other.copy_from(texture)
+    texture.copy_from(pixels)
+    other.copy_to(texture)
+    texture.copy_from(texture)
+    texture.copy_to(output)
+    np.testing.assert_array_equal(output, pixels * 3.0)
+    with test.assertRaisesRegex(ValueError, "contiguous"):
+        texture.copy_from(wp.empty((3, 8, 4), dtype=float, device=device)[:, ::2, :])
+    with test.assertRaisesRegex(ValueError, "shape"):
+        texture.copy_from(np.zeros((2, 4, 4), dtype=np.float32))
+    with test.assertRaisesRegex(ValueError, "data type"):
+        texture.copy_from(pixels.astype(np.float16))
+
+
+def test_sycl_texture_graphs(test, device):
+    for nworld in (1, 2, 64, 1024, 4096):
+        with test.subTest(nworld=nworld):
+            textures = [wp.Texture2D(np.ones((2, 2, 4), dtype=np.float32), device=device) for _ in range(2)]
+            refs = [weakref.ref(texture) for texture in textures]
+            array = wp.clone(wp.array(textures, dtype=wp.Texture2D, device=device)[:])
+            del textures
+            gc.collect()
+            test.assertTrue(all(ref() is not None for ref in refs))
+            selectors = wp.zeros(nworld, dtype=int, device=device)
+            output = wp.empty(nworld, dtype=wp.vec4, device=device)
+            uploads = [wp.empty((2, 2, 4), dtype=float, device=device) for _ in range(2)]
+            for captured in (False, True):
+                if captured:
+                    with wp.ScopedCapture(device=device) as capture:
+                        wp.launch(sycl_texture_array_sample, nworld, inputs=[array, selectors, output], device=device)
+                    del array
+                    gc.collect()
+                    test.assertTrue(all(ref() is not None for ref in refs))
+                for frame in range(3):
+                    colors = np.array(
+                        [
+                            [frame + 1.0, frame + 1.25, frame + 1.5, 1.0],
+                            [frame + 11.0, frame + 11.25, frame + 11.5, 1.0],
+                        ],
+                        dtype=np.float32,
+                    )
+                    for index in range(2):
+                        uploads[index].assign(np.tile(colors[index], (2, 2, 1)))
+                        refs[index]().copy_from(uploads[index])
+                    indices = (np.arange(nworld, dtype=np.int32) + frame) % 2
+                    selectors.assign(indices)
+                    if captured:
+                        wp.capture_launch(capture.graph)
+                    else:
+                        wp.launch(sycl_texture_array_sample, nworld, inputs=[array, selectors, output], device=device)
+                    np.testing.assert_allclose(output.numpy(), colors[indices], rtol=1e-5, atol=1e-5)
+            del capture
+            gc.collect()
+            test.assertTrue(all(ref() is None for ref in refs))
+
+
+def test_sycl_texture_structs(test, device):
+    textures = [wp.Texture2D(np.full((2, 2, 4), index + 1.0, dtype=np.float32), device=device) for index in range(2)]
+    refs = [weakref.ref(texture) for texture in textures]
+    nested = SyclNestedTextureStruct()
+    nested.value.texture = textures[0]
+    entry = SyclTextureStruct()
+    entry.texture = textures[1]
+    entries = wp.clone(wp.array([entry], dtype=SyclTextureStruct, device=device)[:])
+    output = wp.empty(2, dtype=wp.vec4, device=device)
+    with wp.ScopedCapture(device=device) as capture:
+        wp.launch(sycl_texture_struct_sample, 1, inputs=[nested, entries, output], device=device)
+    nested.value.texture = None
+    entry.texture = None
+    del textures, entries
+    gc.collect()
+    test.assertTrue(all(ref() is not None for ref in refs))
+    wp.capture_launch(capture.graph)
+    np.testing.assert_array_equal(output.numpy(), [[1.0] * 4, [2.0] * 4])
+    del capture
+    gc.collect()
+    test.assertTrue(all(ref() is None for ref in refs))
+    host = wp.Texture2D(np.ones((2, 2, 4), dtype=np.float32), device="cpu")
+    nested.value.texture = host
+    entries = wp.empty(1, dtype=SyclTextureStruct, device=device)
+    with test.assertRaisesRegex(RuntimeError, "launch device"):
+        wp.launch(sycl_texture_struct_sample, 1, inputs=[nested, entries, output], device=device)
+    entry.texture = host
+    with test.assertRaisesRegex(ValueError, "array's device"):
+        wp.array([entry], dtype=SyclTextureStruct, device=device)
+
+
+def test_sycl_texture_streams(test, device):
+    texture = wp.Texture2D(np.ones((2, 2, 4), dtype=np.float32), device=device)
+    stream_a, stream_b = wp.Stream(device), wp.Stream(device)
+    ready = wp.Event(device)
+    uv = wp.array([[0.5, 0.5]], dtype=wp.vec2, device=device)
+    arrays = [wp.empty(1, dtype=dtype, device=device) for dtype in (float, wp.vec2, wp.vec4)]
+    with wp.ScopedStream(stream_a):
+        pixels = wp.full((2, 2, 4), 3.0, dtype=float, device=device)
+        texture.copy_from(pixels)
+        stream_a.record_event(ready)
+    with wp.ScopedStream(stream_b):
+        stream_b.wait_event(ready)
+        with wp.ScopedCapture(device=device) as capture:
+            wp.launch(sycl_texture_sample, 1, inputs=[texture, uv, *arrays], device=device)
+        wp.capture_launch(capture.graph)
+        np.testing.assert_array_equal(arrays[2].numpy(), [[3.0] * 4])
+        target = wp.empty_like(pixels)
+        texture.copy_to(target)
+        np.testing.assert_array_equal(target.numpy(), np.full((2, 2, 4), 3.0, dtype=np.float32))
+
+
+def test_sycl_texture_errors(test, device):
+    pixels = np.ones((2, 2, 4), dtype=np.float32)
+    for kwargs in (
+        {"data": pixels.astype(np.float16)},
+        {"data": pixels[:, :, :2]},
+        {"data": pixels, "num_mip_levels": 0},
+        {"data": pixels, "surface_access": True},
+    ):
+        with test.subTest(kwargs=kwargs), test.assertRaises(NotImplementedError):
+            wp.Texture2D(device=device, **kwargs)
+    with test.assertRaises(NotImplementedError):
+        wp.Texture1D(np.ones((2, 4), dtype=np.float32), device=device)
+    with test.assertRaises(NotImplementedError):
+        wp.Texture3D(np.ones((2, 2, 2, 4), dtype=np.float32), device=device)
+    for mode in (wp.TextureAddressMode.WRAP, wp.TextureAddressMode.MIRROR):
+        with test.assertRaisesRegex(RuntimeError, "normalized coordinates"):
+            wp.Texture2D(pixels, device=device, normalized_coords=False, address_mode=mode)
+    try:
+        mixed = wp.Texture2D(
+            pixels, device=device, address_mode=(wp.TextureAddressMode.BORDER, wp.TextureAddressMode.CLAMP)
+        )
+    except RuntimeError as error:
+        test.assertIn("unique per-axis texture addressing modes", str(error))
+    else:
+        target = np.empty_like(pixels)
+        mixed.copy_to(target)
+        np.testing.assert_array_equal(target, pixels)
+    host = wp.Texture2D(pixels, device="cpu")
+    uv = wp.array([[0.5, 0.5]], dtype=wp.vec2, device=device)
+    arrays = [wp.empty(1, dtype=dtype, device=device) for dtype in (float, wp.vec2, wp.vec4)]
+    with test.assertRaisesRegex(RuntimeError, "launch device"):
+        wp.launch(sycl_texture_sample, 1, inputs=[host, uv, *arrays], device=device)
+    with test.assertRaisesRegex(ValueError, "array's device"):
+        wp.array([host], dtype=wp.Texture2D, device=device)
+    texture = wp.Texture2D(pixels, device=device)
+    with test.assertRaisesRegex(RuntimeError, "launch device"):
+        cpu_uv = wp.array([[0.5, 0.5]], dtype=wp.vec2, device="cpu")
+        cpu_arrays = [wp.empty(1, dtype=dtype, device="cpu") for dtype in (float, wp.vec2, wp.vec4)]
+        wp.launch(sycl_texture_sample, 1, inputs=[texture, cpu_uv, *cpu_arrays], device="cpu")
+    unused = wp.Texture2D(pixels, device=device)
+    with wp.ScopedCapture(device=device) as capture:
+        with test.assertRaisesRegex(RuntimeError, "before graph capture"):
+            wp.Texture2D(pixels, device=device)
+        with test.assertRaisesRegex(RuntimeError, "outside graph capture"):
+            texture.copy_from(pixels)
+        del unused
+        gc.collect()
+        wp.launch(sycl_texture_sample, 1, inputs=[texture, uv, *arrays], device=device)
+    wp.capture_launch(capture.graph)
+    np.testing.assert_array_equal(arrays[2].numpy(), np.ones((1, 4), dtype=np.float32))
 
 
 def test_sycl_geometry(test, device):
@@ -1834,6 +2102,12 @@ add_function_test(TestSycl, "test_tile_sort_graph_streams", test_sycl_tile_sort_
 add_function_test(TestSycl, "test_graph", test_sycl_graph, devices=devices)
 add_function_test(TestSycl, "test_strides", test_sycl_strides, devices=devices)
 add_function_test(TestSycl, "test_geometry", test_sycl_geometry, devices=devices)
+add_function_test(TestSycl, "test_textures", test_sycl_textures, devices=devices)
+add_function_test(TestSycl, "test_texture_copies", test_sycl_texture_copies, devices=devices)
+add_function_test(TestSycl, "test_texture_graphs", test_sycl_texture_graphs, devices=devices)
+add_function_test(TestSycl, "test_texture_structs", test_sycl_texture_structs, devices=devices)
+add_function_test(TestSycl, "test_texture_streams", test_sycl_texture_streams, devices=devices)
+add_function_test(TestSycl, "test_texture_errors", test_sycl_texture_errors, devices=devices)
 add_function_test(TestSycl, "test_atomic_types", test_sycl_atomic_types, devices=devices)
 add_function_test(TestSycl, "test_tile_grad", test_sycl_tile_grad, devices=devices)
 add_function_test(TestSycl, "test_graph_lifetimes", test_sycl_graph_lifetimes, devices=devices)

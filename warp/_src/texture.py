@@ -170,6 +170,10 @@ class Texture:
     on CUDA devices. On CPU, software-based filtering and addressing is used. Supports
     linear/bilinear/trilinear interpolation and various addressing modes (wrap, clamp, mirror, border).
 
+    On SYCL devices, hardware sampling uses the experimental DPC++ bindless-image extension.
+    Only single-level float32 RGBA :class:`Texture2D` resources are currently supported,
+    with nearest or linear filtering. Unsupported configurations raise explicit errors.
+
     Supports ``wp.uint8``, ``wp.uint16``, ``wp.uint32``, ``wp.int8``, ``wp.int16``, ``wp.int32``,
     ``wp.float16``, and ``wp.float32`` data types. Unsigned 8- and 16-bit integer textures are read
     as normalized floats in [0, 1]; signed 8- and 16-bit integer textures are normalized to [-1, 1];
@@ -279,8 +283,6 @@ class Texture:
         # self.runtime *after* this call to ensure it is not None.
         device = warp._src.context.get_device(device)
         self._runtime = warp._src.context.runtime
-        if device.is_sycl:
-            raise NotImplementedError("SYCL textures are not yet supported")
 
         # Resolve address modes
         address_mode_u = self._resolve_address_mode(address_mode, address_mode_u, 0)
@@ -378,6 +380,15 @@ class Texture:
             raise ValueError("surface_access is not supported for mipmapped textures")
         if is_mipmapped and device.is_cuda and not normalized_coords:
             raise ValueError("Mipmapped textures on a CUDA device require normalized_coords=True")
+        if device.is_sycl:
+            if ndim != 2 or dtype is not float32 or num_channels != 4:
+                raise NotImplementedError("SYCL textures currently support only 2D float32 RGBA data")
+            if is_mipmapped:
+                raise NotImplementedError("SYCL textures do not yet support mipmaps")
+            if surface_access:
+                raise NotImplementedError("SYCL textures do not support CUDA surface access")
+            if device.is_capturing:
+                raise RuntimeError("Create SYCL textures before graph capture")
 
         self.device = device
         self._width = width
@@ -430,6 +441,22 @@ class Texture:
             )
             if not self._tex_handle:
                 raise RuntimeError(f"Failed to create CUDA texture object: {self._runtime.get_error_string()}")
+        elif device.is_sycl:
+            from warp._src.sycl import check  # noqa: PLC0415
+
+            self._tex_handle = self._runtime.sycl.wp_sycl_texture_create(
+                device.context,
+                width,
+                height,
+                num_channels,
+                dtype_code,
+                filter_mode,
+                address_mode_u,
+                address_mode_v,
+                normalized_coords,
+            )
+            if not self._tex_handle:
+                check(self._runtime.sycl, -1)
         else:
             # create CPU texture
             c_mip_widths = (ctypes.c_int * resolved_num_mip_levels)(*(s[0] for s in mip_shapes))
@@ -477,6 +504,10 @@ class Texture:
                         self._runtime.core.wp_texture_destroy_device(
                             self.device.context, self._array_handle, self._is_mipmapped
                         )
+            elif self.device.is_sycl:
+                from warp._src.sycl import check  # noqa: PLC0415
+
+                check(self._runtime.sycl, self._runtime.sycl.wp_sycl_texture_destroy(self.device.context, self.id))
             else:
                 self._runtime.core.wp_texture_destroy_host(self._tex_handle)
         except (TypeError, AttributeError):
@@ -668,12 +699,14 @@ class Texture:
             )
             if not result:
                 raise RuntimeError(f"Failed to copy to texture: {self._runtime.get_error_string()}")
+        elif self.device.is_sycl:
+            self._copy_sycl(src, to_texture=True)
         else:
             import warp._src.context  # noqa: PLC0415
 
-            # CPU textures can be copied as contiguous arrays, but copying to a CUDA texture is a special case.
+            # GPU textures manage their own backing storage rather than exposing a host pointer.
             if isinstance(src, Texture):
-                if src.device.is_cuda:
+                if not src.device.is_cpu:
                     return src.copy_to(self)
                 src = array(ptr=src._host_ptr, shape=src._get_shape(), dtype=src.dtype, device=src.device)
 
@@ -775,17 +808,45 @@ class Texture:
             )
             if not result:
                 raise RuntimeError(f"Failed to copy to texture: {self._runtime.get_error_string()}")
+        elif self.device.is_sycl:
+            self._copy_sycl(dst, to_texture=False)
         else:
             import warp._src.context  # noqa: PLC0415
 
-            # CPU textures can be copied as contiguous arrays, but copying to a CUDA texture is a special case.
+            # GPU textures manage their own backing storage rather than exposing a host pointer.
             if isinstance(dst, Texture):
-                if dst.device.is_cuda:
+                if not dst.device.is_cpu:
                     return dst.copy_from(self)
                 dst = array(ptr=dst._host_ptr, shape=dst._get_shape(), dtype=dst.dtype, device=dst.device)
 
             self_array = array(ptr=self._host_ptr, shape=self._get_shape(), dtype=self.dtype, device=self.device)
             warp._src.context.copy(dst, self_array)
+
+    def _copy_sycl(self, other: array | Texture, *, to_texture: bool):
+        from warp._src.sycl import check  # noqa: PLC0415
+
+        if self.device.is_capturing:
+            raise RuntimeError("Copy SYCL texture contents outside graph capture")
+        if other.device != self.device and not other.device.is_cpu:
+            raise ValueError(f"SYCL texture copies require CPU data or data on {self.device}, got {other.device}")
+        other_texture = 0
+        other_ptr = None
+        if isinstance(other, Texture):
+            if other.device.is_cpu:
+                other_ptr = other._host_ptr
+            else:
+                other_texture = other.id
+        else:
+            other_ptr = other.ptr
+        dst_texture, dst_ptr, src_texture, src_ptr = (
+            (self.id, None, other_texture, other_ptr) if to_texture else (other_texture, other_ptr, self.id, None)
+        )
+        check(
+            self._runtime.sycl,
+            self._runtime.sycl.wp_sycl_texture_copy(
+                self.device.context, dst_texture, dst_ptr, src_texture, src_ptr, int(other.device.is_cpu)
+            ),
+        )
 
     @staticmethod
     def _compute_mip_shapes(base_shape, ndim, num_mip_levels):
@@ -1059,6 +1120,7 @@ class Texture:
         """Device-independent texture identifier.
 
         On CUDA textures, this is the same handle as :attr:`cuda_texture` (``cudaTextureObject_t``).
+        On SYCL textures, this is a DPC++ bindless sampled-image handle.
         On host textures, this is the backing host texture handle.
         """
         return self._tex_handle

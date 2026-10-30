@@ -16,6 +16,7 @@ namespace {
 struct BvhState : wp::SyclSharedStorage {
     uint64_t host = 0;
     wp::BVH* gpu = nullptr;
+    wp::BVH descriptor {};
     std::vector<wp::vec3> lowers, uppers;
     std::vector<int> groups;
 
@@ -145,6 +146,7 @@ WP_API uint64_t wp_sycl_bvh_create(
         tree.item_lowers = lowers;
         tree.item_uppers = uppers;
         tree.item_groups = groups;
+        state->descriptor = tree;
         state->gpu = state->copy(&tree, 1);
         const auto handle = reinterpret_cast<uint64_t>(state->gpu);
         std::lock_guard<std::mutex> lock(bvh_mutex);
@@ -170,7 +172,7 @@ WP_API int wp_sycl_bvh_refit(uint64_t id)
     return wp::sycl_checked([&] {
         std::lock_guard<std::mutex> lock(bvh_mutex);
         auto& state = *bvhs.at(id);
-        wp::bvh_refit_sycl(state.device, *state.gpu);
+        wp::bvh_refit_sycl(state.device, state.descriptor);
     });
 }
 
@@ -182,12 +184,13 @@ WP_API int wp_sycl_bvh_rebuild(uint64_t id, int constructor)
         auto& state = *bvhs.at(id);
         if (wp_sycl_synchronize(state.device))
             throw std::runtime_error(wp_sycl_get_error_string());
-        wp::sycl_read_array(state.device, state.lowers, state.gpu->item_lowers, state.gpu->num_items);
-        wp::sycl_read_array(state.device, state.uppers, state.gpu->item_uppers, state.gpu->num_items);
-        if (state.gpu->item_groups)
-            wp::sycl_read_array(state.device, state.groups, state.gpu->item_groups, state.gpu->num_items);
+        wp::sycl_read_array(state.device, state.lowers, state.descriptor.item_lowers, state.descriptor.num_items);
+        wp::sycl_read_array(state.device, state.uppers, state.descriptor.item_uppers, state.descriptor.num_items);
+        if (state.descriptor.item_groups)
+            wp::sycl_read_array(state.device, state.groups, state.descriptor.item_groups, state.descriptor.num_items);
         wp_bvh_rebuild_host(state.host, constructor);
-        wp::bvh_update_sycl(*state.gpu, *reinterpret_cast<wp::BVH*>(state.host));
+        wp::bvh_update_sycl(state.descriptor, *reinterpret_cast<wp::BVH*>(state.host));
+        std::memcpy(state.gpu, &state.descriptor, sizeof(wp::BVH));
     });
 }
 

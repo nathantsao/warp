@@ -206,6 +206,7 @@ struct SyclDevice {
     std::vector<SyclFreeInfo> deferred_frees;
     std::vector<std::unique_ptr<SyclGraph>> deferred_graphs;
     std::vector<void*> deferred_modules;
+    std::vector<std::shared_ptr<void>> deferred_resources;
     size_t max_work_group_size;
     size_t local_memory_size;
     bool has_fp64;
@@ -325,7 +326,8 @@ void run_deferred_actions(SyclDevice& state)
     const bool graph_frees = std::any_of(state.graph_allocs.begin(), state.graph_allocs.end(), [](const auto& entry) {
         return entry.second.graph_destroyed && !entry.second.ref_exists;
     });
-    if (state.deferred_frees.empty() && state.deferred_graphs.empty() && state.deferred_modules.empty() && !graph_frees)
+    if (state.deferred_frees.empty() && state.deferred_graphs.empty() && state.deferred_modules.empty()
+        && state.deferred_resources.empty() && !graph_frees)
         return;
 
     // Escaped arrays may also have been used by eager work on another stream.
@@ -363,8 +365,19 @@ void run_deferred_actions(SyclDevice& state)
             throw std::runtime_error(dlerror());
         state.deferred_modules.pop_back();
     }
+    state.deferred_resources.clear();
 }
 
+}
+
+void wp::sycl_defer_resource(void* device, std::shared_ptr<void> resource)
+{
+    auto& state = get_device(device);
+    {
+        std::lock_guard<std::mutex> lock(state.memory_mutex);
+        state.deferred_resources.push_back(std::move(resource));
+    }
+    run_deferred_actions(state);
 }
 
 const char* wp_sycl_get_error_string() { return last_error.c_str(); }

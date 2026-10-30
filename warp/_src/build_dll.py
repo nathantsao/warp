@@ -1034,6 +1034,7 @@ def build_sycl_runtime(output: str, mode: str = "release") -> None:
             str(native / "mesh_sycl.cpp"),
             str(native / "scan_sycl.cpp"),
             str(native / "sort_sycl.cpp"),
+            str(native / "texture_sycl.cpp"),
             "-L",
             str(native.parent / "bin"),
             "-l:warp.so",

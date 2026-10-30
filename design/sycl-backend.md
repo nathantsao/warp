@@ -33,6 +33,7 @@ reference, not a source-compatible patch for this version.
 | Route native diagnostics through SYCL's device `printf`. | Preserve diagnostics rather than silently disabling them. |
 | Build BVHs/meshes with existing native host SAH/median builders, then own shared-USM native structures. | Reuse current layouts and algorithms without copying private C++ layouts into Python. |
 | Refit ordinary geometry on the GPU; stage winding-number refits explicitly on the host. | Support queries/refits while keeping the host portion visible and bounded. |
+| Keep a separate host BVH descriptor for refit launch metadata. | Do not read the GPU's shared-USM descriptor on the host while queued work is using it, or add a device-wide wait to every refit. |
 | Give empty SYCL trees a valid empty leaf/root. | Native queries dereference the root even when the host builder produced no nodes. |
 | Always compile oneAPI command graphs with the SYCL backend and retain captured arrays/modules. | Match CUDA's backend-level inclusion, require a graph-capable compiler, and preserve buffer/code lifetimes without emulating CUDA graph handles. |
 | Map `wp.Stream` to an in-order queue with profiling enabled, and `wp.Event` to a `sycl::event`; keep a per-device current stream. | Match CUDA's stream and event semantics (ordering, `wait_event`, `ScopedStream`, event timing) without assuming queues are CUDA streams. Each stream owns its staging buffers so streams cannot corrupt each other's arguments. |
@@ -44,6 +45,7 @@ reference, not a source-compatible patch for this version.
 | Implement `array_scan`, `radix_sort_pairs` and `segmented_sort_pairs` as native SYCL kernels on the current stream, with per-stream scratch that a graph takes ownership of during capture. | Public Warp utilities that MJWarp calls every step. Library implementations (oneDPL) block and allocate internally, which breaks asynchronous ordering and graph capture. |
 | Implement `tile_sort` with work-group bitonic compare-exchanges over the existing local-memory arena and barriers. | Preserve CUDA's in-place key/value contract without assuming 32-lane subgroups, adding host work, or forking MJWarp's tiled SAP and contact-sensor kernels. |
 | Track capture-time device-USM allocations with shared graph/user ownership, and defer frees and module unloading until capture ends. | Match CUDA's allocation lifetime contract without assuming that SYCL graph-owned allocation nodes can produce arrays usable outside their graph. |
+| Implement RGBA32F 2D textures with DPC++ experimental bindless images and retain texture owners across arrays, copies and captured arguments. | Preserve Warp's opaque texture-handle ABI and use hardware filtering without a second renderer or a software sampling fallback. |
 | Reject unsupported resources, interop, launch options, and native utilities. | An unavailable operation must not silently execute on the CPU or dispatch a SYCL pointer to CUDA. |
 | Add dedicated GPU tests and run existing CPU regressions. | Exercise backend behavior while checking that shared code changes preserve CPU behavior. |
 
@@ -59,11 +61,46 @@ reference, not a source-compatible patch for this version.
   mesh point/velocity replacement, and host-backed winding-number refit.
 - Array-wide `wp.utils.array_scan`, `radix_sort_pairs` and `segmented_sort_pairs`,
   asynchronous on the current stream and recordable into graphs.
+- Single-level RGBA32F `wp.Texture2D` resources, hardware nearest/linear sampling,
+  texture arrays, and captured sampling through DPC++ experimental bindless images.
 - Basic command-graph capture/replay, including array allocations during capture,
   always built with SYCL. The compiler must provide the oneAPI graph extension;
   capture checks device support at runtime.
 - Nested event timing in native-recording graphs with Level Zero v2. Timing events
   are automatically external, matching CUDA's public recording API.
+
+### Bindless textures
+
+`texture_sycl.cpp` owns DPC++ `image_mem` allocations and `sampled_image_handle`
+objects. The existing texture kernel descriptor carries the raw bindless handle;
+device code in `texture.h` samples it directly with `sample_image`. Runtime-selected
+texture-array elements do not require accessors or a different kernel ABI. This is
+hardware image sampling, not interpolation over an ordinary USM array.
+
+The supported storage is 2D, float32, four channels and one mip level. Sampling can
+return a float, vec2 or vec4. Nearest and linear filtering support clamp, border,
+wrap and mirror modes. Wrap/mirror require normalized coordinates; unnormalized
+coordinates support clamp/border. Mixed U/V modes require the device's
+`ext_oneapi_unique_addressing_per_dim` aspect. The validated B70 configuration does
+not advertise that aspect, so mixed modes are rejected rather than silently using
+one mode for both axes. Other dimensions, storage formats, mipmaps and surface
+access also raise explicit errors.
+
+Create and copy textures outside graph capture. Host/device/image transfers use
+the current in-order queue, with explicit event dependencies for cross-stream use;
+host transfers wait for completion. Captured sampling can observe texture updates
+submitted before replay. Direct arguments, nested structs, and texture/struct
+arrays created from Python objects retain the texture owners. Array copies and
+views preserve those references, and capture snapshots the nested resources even
+if a Python struct field is later reassigned. Raw handles or NumPy structured data
+cannot recover Python owners automatically. Native destruction is deferred until
+queued users complete, including destruction during an unrelated capture.
+
+Sampling regressions use analytical nearest-wrap seam expectations: the existing
+CPU sampler clamps a rounded index at that seam instead of wrapping it. CPU and
+CUDA sampling implementations are unchanged; CPU output is not treated as an
+oracle for that boundary case. No software or CPU fallback is provided when the
+bindless extension or a required image capability is unavailable.
 
 ### Captured event semantics
 
@@ -135,7 +172,7 @@ This stage does not implement CUDA/SYCL direct copies, peer copies, external
 (interop) streams/events, capturing work from several streams, external event waits
 between graphs, APIC serialization, conditional graphs, recorded `Launch` commands,
 deterministic lowering, custom module preambles/includes, floating-point
-verification, indexed arrays, textures, volumes, hash grids, sparse matrices, or
+verification, indexed arrays, volumes, hash grids, sparse matrices, or
 DLPack interoperability. Tile FFT is not enabled. Tile matrix
 multiplication, Cholesky and triangular solves use Warp's portable scalar
 implementations; no vendor matrix engine (XMX/oneMKL) is used yet.
@@ -324,10 +361,12 @@ before performance.
      then radix sorting for larger 32-bit tiles. SYCL initially uses bitonic sorting for all
      supported lengths within the device's local-memory budget. The threshold is a tuning
      choice, not a public size limit. CPU and CUDA implementations are unchanged.
-4. **Textures and rendering.** Add `texture_sample` for 2D textures (a sampled-image
-   path, or a bilinear sampler over USM if the image extension is unavailable). In MJWarp,
-   `render_util.py:406` hard-codes `constructor = "cubql"`; selecting `"sah"` on non-CUDA
-   devices needs no Warp change because the backend already builds SAH trees on the host.
+4. **Textures and rendering.** *Implemented and qualified for the bindless subset above.*
+   MJWarp selects `"sah"` for non-CUDA mesh/heightfield construction and keeps its
+   existing renderer. A separate host BVH launch descriptor fixes a shared-USM host
+   read during asynchronous refit without synchronizing every refit. Existing
+   rendering regressions and changing-input forward/refit/render capture pass
+   through 4096 worlds. This does not resolve the physics issues in steps 5 and 6.
 5. **Optimized multi-contact CCD correctness.** Seven cases remain: four capsule-mesh
    and three cylinder contact tests. The capsule-mesh path
    (`test_capsule_mesh_multiccd_*`) gives wrong results at default optimization. Earlier probes passed with
@@ -476,6 +515,31 @@ tolerances, and enabled status are unchanged. This is not a fully passing MJWarp
 run; resolving the compiler-stage error and tracing the remaining cylinder paths
 is still required. Compiler work is deferred: these fixes leave the toolchain,
 driver configuration, and optimization policy unchanged.
+
+Bindless/rendering validation uses Arc Pro B70, oneAPI 2026.1.1, the unmodified
+Level Zero v2 runtime, Warp 1.18.0, MJWarp 3.16.0 and MuJoCo
+`3.17.1.dev1008153370`. Headless reference rendering uses `MUJOCO_GL=egl`.
+
+| Suite | Result |
+|---|---|
+| Warp dedicated SYCL tests | 90 passed, 1 adapter-specific negative test skipped |
+| Warp existing CPU texture tests | 61 passed |
+| MJWarp BVH, rays, render utilities and rendering on SYCL | 144 passed, 1 known flex-layout case deselected |
+| MJWarp new one/two-world forward/refit/render capture on CPU | 2 passed |
+
+The SYCL run includes seven geometry/texture groups covering addressing/filtering,
+copies, runtime handle arrays, nested struct/struct-array ownership, field mutation
+after capture, cross-stream ordering, self-copy and destruction. The MJWarp camera
+regression exercises 1, 2, 64, 1024 and 4096 worlds over three changing-input frames,
+compares eager and captured RGB/depth/segmentation outputs, checks their exact
+shapes/dtypes, and compares ray depths with MuJoCo CPU. These are rendering and
+forward-state checks, not a long physics integration or performance qualification.
+
+The deselected `test_get_segmentation_preserves_flex_ids` was run separately on both
+CPU and SYCL and fails before GPU execution: the installed MuJoCo supplies 24 flex
+parameters where MJWarp expects two vec11 fields. No compatibility patch or
+permanent skip was added. The seven CCD failures and large-world line-search
+investigation remain open; the bindless results do not supersede those baselines.
 
 MJWarp itself is the integration test: `pytest --device sycl:0 -n 24` in `mujoco_warp`.
 

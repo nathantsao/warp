@@ -5,6 +5,10 @@
 
 #include "builtin.h"
 
+#if defined(__SYCL_DEVICE_ONLY__)
+#include <sycl/ext/oneapi/bindless_images.hpp>
+#endif
+
 namespace wp {
 
 // Data type constants (must match texture.cpp and Python side)
@@ -694,6 +698,16 @@ template <typename T> __device__ T tex3DLod(unsigned long long texObj, float x, 
 // Any nonnegative ``lod`` value routes through the mipmap-aware path (``tex1DLod`` / ...).
 template <typename T> struct texture_sample_helper;
 
+#if defined(__SYCL_DEVICE_ONLY__)
+inline sycl::float4 texture_sample_sycl(const texture2d_t& tex, float u, float v)
+{
+    if (tex.tex == 0)
+        return sycl::float4(0.0f);
+    namespace experimental = sycl::ext::oneapi::experimental;
+    return experimental::sample_image<sycl::float4>(experimental::sampled_image_handle(tex.tex), sycl::float2(u, v));
+}
+#endif
+
 template <> struct texture_sample_helper<float> {
     static CUDA_CALLABLE float sample_1d(const texture1d_t& tex, float u, float lod)
     {
@@ -717,6 +731,8 @@ template <> struct texture_sample_helper<float> {
         if (lod < 0.0f)
             return tex2D<float>(tex.tex, u, v);
         return tex2DLod<float>(tex.tex, u, v, lod);
+#elif defined(__SYCL_DEVICE_ONLY__)
+        return texture_sample_sycl(tex, u, v)[0];
 #else
         if (tex.tex == 0)
             return 0.0f;
@@ -808,6 +824,9 @@ template <> struct texture_sample_helper<vec2f> {
         else
             val = (lod < 0.0f) ? tex2D<float2>(tex.tex, u, v) : tex2DLod<float2>(tex.tex, u, v, lod);
         return vec2f(val.x, val.y);
+#elif defined(__SYCL_DEVICE_ONLY__)
+        const auto val = texture_sample_sycl(tex, u, v);
+        return vec2f(val[0], val[1]);
 #else
         if (tex.tex == 0)
             return vec2f(0.0f, 0.0f);
@@ -897,6 +916,9 @@ template <> struct texture_sample_helper<vec4f> {
         else
             val = (lod < 0.0f) ? tex2D<float4>(tex.tex, u, v) : tex2DLod<float4>(tex.tex, u, v, lod);
         return vec4f(val.x, val.y, val.z, val.w);
+#elif defined(__SYCL_DEVICE_ONLY__)
+        const auto val = texture_sample_sycl(tex, u, v);
+        return vec4f(val[0], val[1], val[2], val[3]);
 #else
         if (tex.tex == 0)
             return vec4f(0.0f, 0.0f, 0.0f, 0.0f);
@@ -962,6 +984,9 @@ CUDA_CALLABLE inline void texture_assert_sampleable(int32 dtype)
 #if defined(__CUDA_ARCH__)
     printf("texture_sample() does not support 32-bit integer textures\n");
     __trap();
+#elif defined(__SYCL_DEVICE_ONLY__)
+    printf("texture_sample() does not support 32-bit integer textures\n");
+    __builtin_trap();
 #else
     _wp_assert("texture_sample() does not support 32-bit integer textures", __FILE__, unsigned(__LINE__));
 #endif

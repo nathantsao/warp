@@ -247,13 +247,12 @@ user can access the GPU render node, and initialize the oneAPI environment:
 
 The compiler is found as ``icpx`` on ``PATH``; ``WARP_SYCL_COMPILER`` can select
 another compiler executable. Keep the oneAPI runtime environment available
-when importing Warp or compiling kernels. SYCL is opt-in and is not included
-in the standard prebuilt wheels. To build CUDA and SYCL together, omit
-``--no-cuda`` and configure the CUDA Toolkit normally.
+when importing Warp or compiling kernels. Warp's SYCL backend
+is not included in standard prebuilt ``warp-lang`` wheels and can only be 
+built from source.
 
 CMake builds use ``-DWARP_ENABLE_SYCL=ON`` and optionally
-``-DWARP_SYCL_COMPILER=/path/to/icpx``. The companion library is built after the
-core library and generated headers.
+``-DWARP_SYCL_COMPILER=/path/to/icpx``.
 
 Command-graph support is always compiled when SYCL is enabled; there is no
 separate graph build flag. The oneAPI compiler must provide the command-graph
@@ -300,7 +299,10 @@ Select the backend explicitly:
 
 The first stage supports ordinary kernels and gradients, regular/strided
 arrays, basic cooperative tiles, BVH/mesh queries, and graph capture/replay
-with array allocations and event timing during capture.
+with array allocations and event timing during capture. Single-level RGBA32F
+``Texture2D`` resources support hardware nearest/linear filtering and captured
+sampling through experimental DPC++ bindless images. Allocate and copy textures
+outside capture, then retain their owners while queued kernels use them.
 It has been validated with oneAPI 2026.1.1 on Intel Arc Pro B70.
 SYCL remains distinct from CPU and CUDA; existing default-device selection
 does not change.
@@ -312,8 +314,9 @@ host SAH/median builders, and winding-number refit is explicitly host-backed.
 :func:`tile_sort <warp._src.lang.tile_sort>` also runs cooperatively on the device, including in captured
 graphs, with the same key types and generic value payloads as CUDA. Non-power-of-two
 tiles require padded local-memory workspace; exceeding the device budget raises an error.
-Other unsupported operations raise errors. Tile FFT, array-wide reductions and
-run-length encoding, textures, volumes, hash grids, sparse matrices, indexed arrays,
+Other unsupported operations raise errors. Other texture dimensions/formats,
+mipmaps and surface access, tile FFT, array-wide reductions and
+run-length encoding, volumes, hash grids, sparse matrices, indexed arrays,
 external streams, DLPack, conditional graphs, and graph serialization are not
 supported yet. Events support single-stream capture; capturing several streams
 remains unsupported. Tiled kernels

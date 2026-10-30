@@ -103,6 +103,7 @@ if(WARP_ENABLE_SYCL)
                 "${WARP_NATIVE_DIR}/mesh_sycl.cpp"
                 "${WARP_NATIVE_DIR}/scan_sycl.cpp"
                 "${WARP_NATIVE_DIR}/sort_sycl.cpp"
+                "${WARP_NATIVE_DIR}/texture_sycl.cpp"
                 "-L${WARP_BIN_DIR}" -l:warp.so -lze_loader "-Wl,-rpath,$ORIGIN"
                 -o "${WARP_BIN_DIR}/warp-sycl.so"
         DEPENDS warp ${WARP_SYCL_HEADERS}
@@ -111,6 +112,7 @@ if(WARP_ENABLE_SYCL)
                 "${WARP_NATIVE_DIR}/mesh_sycl.cpp"
                 "${WARP_NATIVE_DIR}/scan_sycl.cpp"
                 "${WARP_NATIVE_DIR}/sort_sycl.cpp"
+                "${WARP_NATIVE_DIR}/texture_sycl.cpp"
                 "${WARP_NATIVE_DIR}/sycl_runtime.h"
                 "${WARP_NATIVE_DIR}/version.h"
                 "${WARP_NATIVE_DIR}/api.h"
