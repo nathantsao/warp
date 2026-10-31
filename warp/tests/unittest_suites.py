@@ -143,6 +143,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.interop.test_dlpack import TestDLPack
     from warp.tests.interop.test_jax import TestJax
     from warp.tests.interop.test_torch import TestTorch
+    from warp.tests.interop.test_torch_xpu import TestTorchXpu
     from warp.tests.matrix.test_mat import TestMat
     from warp.tests.matrix.test_mat_assign_copy import TestMatAssignCopy
     from warp.tests.matrix.test_mat_basics import TestMatBasics
@@ -492,6 +493,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestTileStruct,
         TestTileView,
         TestTorch,
+        TestTorchXpu,
         TestTorchAllocator,
         TestTransientModule,
         TestTriangleClosestPoint,

@@ -248,15 +248,29 @@ user can access the GPU render node, and initialize the oneAPI environment:
 The compiler is found as ``icpx`` on ``PATH``; ``WARP_SYCL_COMPILER`` can select
 another compiler executable. Keep the oneAPI runtime environment available
 when importing Warp or compiling kernels. Warp's SYCL backend
-is not included in standard prebuilt ``warp-lang`` wheels and can only be 
+is not included in standard prebuilt ``warp-lang`` wheels and can only be
 built from source.
 
 CMake builds use ``-DWARP_ENABLE_SYCL=ON`` and optionally
 ``-DWARP_SYCL_COMPILER=/path/to/icpx``.
 
+The SYCL source lists, compiler flags, and linking remain defined directly in
+``CMakeLists.txt`` and ``warp/_src/build_dll.py``, following the existing build
+layout. Both use ``-O2 -DNDEBUG`` for Release and ``-O0 -g`` for Debug.
+Verify that both companion build definitions remain aligned:
+
+.. code-block:: console
+
+    $ uv run --no-sync python tools/ci/test_sycl_build.py
+
+This check requires CMake and working host and oneAPI compilers. It builds the
+CPU core and SYCL companion in temporary source copies for both configurations,
+compares CMake's actual arguments with the Python builder, and loads the
+resulting libraries. It does not replace the checkout's native libraries.
+
 Command-graph support is always compiled when SYCL is enabled; there is no
 separate graph build flag. The oneAPI compiler must provide the command-graph
-extension. Devices without graph support can still run ordinary kernels, but
+and profiling-tag extensions. Devices without graph support can still run ordinary kernels, but
 graph capture raises an error.
 
 Warp preserves the oneAPI adapter selection. Use

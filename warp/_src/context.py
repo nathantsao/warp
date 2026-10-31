@@ -5731,7 +5731,7 @@ class Event:
 
 
 class Stream:
-    """CUDA stream wrapper for managing asynchronous GPU operations.
+    """CUDA stream or SYCL queue wrapper for managing asynchronous GPU operations.
 
     See also:
         :func:`warp.get_stream`, :func:`warp.set_stream`, :class:`warp.ScopedStream`
@@ -5782,6 +5782,13 @@ class Stream:
             self._is_blocking = True
             if "sycl_stream" in kwargs:
                 self.sycl_stream = kwargs["sycl_stream"]
+            elif "sycl_queue" in kwargs:
+                from warp._src.sycl import check  # noqa: PLC0415
+
+                self.sycl_stream = device.runtime.sycl.wp_sycl_stream_from_queue(device.context, kwargs["sycl_queue"])
+                if not self.sycl_stream:
+                    check(device.runtime.sycl, -1)
+                self.owner = True
             else:
                 self.sycl_stream = device.runtime.sycl.wp_sycl_stream_create(device.context)
                 if not self.sycl_stream:
@@ -5834,6 +5841,13 @@ class Stream:
     def __cuda_stream__(self):
         # CUDA Stream Protocol: https://nvidia.github.io/cuda-python/cuda-core/latest/interoperability.html#cuda-stream-protocol
         return (0, int(self.cuda_stream) if self.cuda_stream else 0)
+
+    @property
+    def sycl_queue(self) -> int:
+        """Address of the owned ``sycl::queue`` object, for SYCL interoperability."""
+        if not self.device.is_sycl:
+            raise RuntimeError("Only SYCL streams have a SYCL queue")
+        return self.device.runtime.sycl.wp_sycl_stream_queue(self.sycl_stream)
 
     @property
     def cached_event(self) -> Event:
@@ -14458,7 +14472,13 @@ def capture_launch(graph: Graph, stream: Stream | None = None):
         from warp._src.sycl import check  # noqa: PLC0415
 
         if stream is not None:
-            raise NotImplementedError("SYCL graphs do not support CUDA streams")
+            if stream.device != graph.device:
+                raise RuntimeError(
+                    f"Cannot launch graph from device {graph.device} on stream from device {stream.device}"
+                )
+            with warp.ScopedStream(stream):
+                capture_launch(graph)
+            return
         check(runtime.sycl, runtime.sycl.wp_sycl_graph_launch(graph.device.context, graph.graph))
         if graph.device.is_capturing:
             graph.device.captures[None]._sycl_refs.append(graph)

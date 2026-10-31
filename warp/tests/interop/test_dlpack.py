@@ -712,6 +712,11 @@ def test_dlpack_bf16_round_trip(test, device):
 
 
 class TestDLPack(unittest.TestCase):
+    def test_explicit_queue_requires_sycl(self):
+        source = wp.zeros(1, device="cpu")
+        with self.assertRaisesRegex(ValueError, "only supported for SYCL"):
+            wp.to_dlpack(source, stream=1)
+
     def test_invalid_capsule_error(self):
         class InvalidDLPackSource:
             def __dlpack_device__(self):

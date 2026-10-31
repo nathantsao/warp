@@ -1783,8 +1783,6 @@ def test_sycl_sort_graph_stream_destruction(test, device):
 
 def test_sycl_unsupported(test, device):
     x = wp.ones(1, device=device)
-    with test.assertRaisesRegex(NotImplementedError, "DLPack"):
-        wp.to_dlpack(x)
     with test.assertRaisesRegex(NotImplementedError, "indexed arrays"):
         wp.indexedarray(x)
     with test.assertRaisesRegex(NotImplementedError, "hash grids"):

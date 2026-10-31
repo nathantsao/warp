@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ctypes
+from functools import cache
 from typing import TYPE_CHECKING
 
 import numpy
@@ -13,6 +14,38 @@ import warp._src.context
 
 if TYPE_CHECKING:
     import torch
+
+
+@cache
+def _check_torch_xpu_runtime():
+    import torch  # noqa: PLC0415
+
+    from warp._src.sycl import check  # noqa: PLC0415
+
+    warp.init()
+    library = warp._src.context.runtime.sycl
+    version = torch.version.xpu
+    if library is None or version is None:
+        raise RuntimeError("SYCL interoperability requires both Warp SYCL and an XPU-enabled PyTorch build")
+    check(library, library.wp_sycl_runtime_check(int(version), int(torch._C._GLIBCXX_USE_CXX11_ABI)))
+
+
+@cache
+def _device_from_torch_xpu(index: int):
+    import torch  # noqa: PLC0415
+
+    from warp._src.sycl import check  # noqa: PLC0415
+
+    _check_torch_xpu_runtime()
+    runtime = warp._src.context.runtime
+    stream = torch.xpu.current_stream(index)
+    context = runtime.sycl.wp_sycl_device_from_queue(stream.sycl_queue)
+    if context is None:
+        check(runtime.sycl, -1)
+    for device in runtime.sycl_devices:
+        if device.context == context:
+            return device
+    raise RuntimeError(f"No Warp device is registered for Torch XPU device {index}")
 
 
 # return the warp device corresponding to a torch device
@@ -25,7 +58,14 @@ def device_from_torch(torch_device: torch.device | str) -> warp.Device:
     Raises:
         RuntimeError: Torch device does not have a corresponding Warp device
     """
+    warp.init()
     if type(torch_device) is str:
+        if torch_device == "xpu" or torch_device.startswith("xpu:"):
+            import torch  # noqa: PLC0415
+
+            torch_device = torch.device(torch_device)
+            index = torch.xpu.current_device() if torch_device.index is None else torch_device.index
+            return _device_from_torch_xpu(index)
         warp_device = warp._src.context.runtime.device_map.get(torch_device)
         if warp_device is not None:
             return warp_device
@@ -36,9 +76,18 @@ def device_from_torch(torch_device: torch.device | str) -> warp.Device:
     else:
         try:
             if torch_device.type == "cuda":
+                if torch_device.index is None:
+                    import torch  # noqa: PLC0415
+
+                    return warp._src.context.runtime.cuda_devices[torch.cuda.current_device()]
                 return warp._src.context.runtime.cuda_devices[torch_device.index]
             elif torch_device.type == "cpu":
                 return warp._src.context.runtime.cpu_device
+            elif torch_device.type == "xpu":
+                import torch  # noqa: PLC0415
+
+                index = torch.xpu.current_device() if torch_device.index is None else torch_device.index
+                return _device_from_torch_xpu(index)
             else:
                 raise RuntimeError(f"Unsupported Torch device type {torch_device.type}")
         except Exception as e:
@@ -59,12 +108,32 @@ def device_to_torch(warp_device: warp.DeviceLike) -> str:
         RuntimeError: The Warp device is not compatible with PyTorch.
     """
     device = warp.get_device(warp_device)
+    if device.is_sycl:
+        import torch  # noqa: PLC0415
+
+        _check_torch_xpu_runtime()
+        for index in range(torch.xpu.device_count()):
+            if _device_from_torch_xpu(index) == device:
+                return f"xpu:{index}"
+        raise RuntimeError(f"Warp device {device} has no corresponding Torch XPU device")
     if device.is_cpu or device.is_primary:
         return str(device)
     elif device.is_cuda and device.is_uva:
         # it's not a primary context, but torch can access the data ptr directly thanks to UVA
         return f"cuda:{device.ordinal}"
     raise RuntimeError(f"Warp device {device} is not compatible with torch")
+
+
+def _prepare_xpu_tensor(t, device):
+    from warp._src.sycl import check  # noqa: PLC0415
+
+    producer = stream_from_torch(t.device)
+    consumer = device.stream
+    library = device.runtime.sycl
+    check(library, library.wp_sycl_pointer_check(device.context, t.data_ptr()))
+    check(library, library.wp_sycl_queue_wait_stream(device.context, consumer.sycl_queue, producer.sycl_stream))
+    t.record_stream(stream_to_torch(consumer))
+    return producer, consumer
 
 
 def dtype_to_torch(warp_dtype):
@@ -222,6 +291,9 @@ def from_torch(
     elif not dtype_is_compatible(t.dtype, dtype):
         raise RuntimeError(f"Cannot convert Torch type {t.dtype} to Warp type {dtype}")
 
+    device = device_from_torch(t.device)
+    interop_streams = _prepare_xpu_tensor(t, device) if device.is_sycl else None
+
     # get size of underlying data type to compute strides
     ctype_size = ctypes.sizeof(dtype._type_)
 
@@ -301,6 +373,8 @@ def from_torch(
         # keep data and gradient alive
         array_ctype._ref = t
         array_ctype._gradref = grad
+        if interop_streams is not None:
+            array_ctype._interop_streams = interop_streams
 
         return array_ctype
 
@@ -321,7 +395,7 @@ def from_torch(
             shape=shape,
             strides=strides,
             capacity=capacity,
-            device=device_from_torch(t.device),
+            device=device,
             copy=False,
             grad=grad,
             requires_grad=requires_grad,
@@ -330,6 +404,8 @@ def from_torch(
 
         # save a reference to the source tensor, otherwise it may get deallocated
         a._tensor = t
+        if interop_streams is not None:
+            a._interop_streams = interop_streams
         if ptr:
             # APIC uses allocation-wide bounds to recognize independently
             # converted views of the same PyTorch storage as one memory region.
@@ -363,6 +439,17 @@ def to_torch(a: warp.array, requires_grad: bool | None = None):
     # Torch does not support structured arrays
     if isinstance(a.dtype, warp._src.codegen.Struct):
         raise RuntimeError("Cannot convert structured Warp arrays to Torch.")
+
+    if a.device.is_sycl:
+        torch_device = device_to_torch(a.device)
+        consumer = torch.xpu.current_stream(torch_device)
+        with torch.xpu.device(torch_device):
+            t = torch.from_dlpack(a.__dlpack__(stream=consumer.sycl_queue))
+        t.requires_grad = requires_grad
+        if requires_grad and a.requires_grad:
+            t.grad = to_torch(a.grad, requires_grad=False)
+        t._warp_array = a
+        return t
 
     # bfloat16 is not representable via __array_interface__ or __cuda_array_interface__
     # (it exposes as uint16), so use DLPack for a correct dtype round-trip.
@@ -404,7 +491,7 @@ def to_torch(a: warp.array, requires_grad: bool | None = None):
 
 
 def stream_from_torch(stream_or_device=None):
-    """Convert from a Torch CUDA stream to a Warp CUDA stream.
+    """Convert a Torch CUDA stream or XPU queue to a Warp stream.
 
     Streams created using ``torch.cuda.Stream()`` are non-blocking and the returned
     ``warp.Stream`` inherits that behavior.
@@ -412,6 +499,21 @@ def stream_from_torch(stream_or_device=None):
     See :ref:`nonblocking_streams` for details and mitigation strategies.
     """
     import torch  # noqa: PLC0415
+
+    if isinstance(stream_or_device, torch.xpu.Stream):
+        stream = stream_or_device
+    elif (isinstance(stream_or_device, torch.device) and stream_or_device.type == "xpu") or (
+        isinstance(stream_or_device, str) and (stream_or_device == "xpu" or stream_or_device.startswith("xpu:"))
+    ):
+        stream = torch.xpu.current_stream(stream_or_device)
+    else:
+        stream = None
+
+    if stream is not None:
+        device = device_from_torch(stream.device)
+        warp_stream = warp.Stream(device, sycl_queue=stream.sycl_queue)
+        warp_stream._torch_stream = stream
+        return warp_stream
 
     if isinstance(stream_or_device, torch.cuda.Stream):
         stream = stream_or_device
@@ -430,7 +532,7 @@ def stream_from_torch(stream_or_device=None):
 
 
 def stream_to_torch(stream_or_device=None):
-    """Convert from a Warp CUDA stream to a Torch CUDA stream.
+    """Convert a Warp CUDA stream or SYCL queue to a Torch stream.
 
     Streams created using ``warp.Stream()`` are blocking and the returned PyTorch ``ExternalStream`` inherits that behavior.
     This means PyTorch operations on the returned stream will implicitly synchronize
@@ -447,7 +549,10 @@ def stream_to_torch(stream_or_device=None):
 
     device = device_to_torch(stream.device)
 
-    torch_stream = torch.cuda.ExternalStream(stream.cuda_stream, device=device)
+    if stream.device.is_sycl:
+        torch_stream = torch.xpu.get_stream_from_external(stream.sycl_queue, device=device)
+    else:
+        torch_stream = torch.cuda.ExternalStream(stream.cuda_stream, device=device)
 
     # save a reference to the source stream, otherwise it may be destroyed
     torch_stream._warp_stream = stream

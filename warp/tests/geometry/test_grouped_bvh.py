@@ -275,6 +275,61 @@ def test_bvh_query_ray(test, device):
     test_bvh(test, "ray", device)
 
 
+def test_grouped_refit_translated_bounds(test, device):
+    num_groups = 64
+    bounds_per_group = 36
+    num_bounds = num_groups * bounds_per_group
+    lowers = np.zeros((num_bounds, 3), dtype=np.float32)
+    lowers[:, 0] = np.tile(np.arange(bounds_per_group) * 2.0, num_groups)
+    lowers[:, 1] = np.repeat(np.arange(num_groups) * 2.0, bounds_per_group)
+    groups = wp.array(np.repeat(np.arange(num_groups), bounds_per_group), dtype=int, device=device)
+    group_ids = wp.array(np.arange(num_groups), dtype=int, device=device)
+    hits = wp.zeros(num_bounds, dtype=int, device=device)
+
+    for constructor, leaf_size in itertools.product(("sah", "median"), (1, 4)):
+        with test.subTest(constructor=constructor, leaf_size=leaf_size):
+            device_lowers = wp.array(lowers, dtype=wp.vec3, device=device)
+            device_uppers = wp.array(lowers + 0.5, dtype=wp.vec3, device=device)
+            bvh = wp.Bvh(device_lowers, device_uppers, groups=groups, constructor=constructor, leaf_size=leaf_size)
+
+            for iteration, shift in enumerate((1000.0, 2000.0)):
+                if iteration:
+                    bvh.rebuild(None if device.is_cuda else constructor)
+                device_lowers.assign(lowers + shift)
+                device_uppers.assign(lowers + shift + 0.5)
+                if iteration and not device.is_cpu:
+                    with wp.ScopedCapture(device=device) as capture:
+                        bvh.refit()
+                    wp.capture_launch(capture.graph)
+                else:
+                    bvh.refit()
+
+                query_lower = wp.vec3(shift - 1.0)
+                query_upper = wp.vec3(shift + 2.0 * num_groups + 1.0)
+                hits.zero_()
+                wp.launch(
+                    bvh_query_aabb,
+                    dim=1,
+                    inputs=[bvh.id, query_lower, query_upper],
+                    outputs=[hits],
+                    device=device,
+                )
+                np.testing.assert_array_equal(hits.numpy(), np.ones(num_bounds, dtype=np.int32))
+
+                hits.zero_()
+                wp.launch(
+                    bvh_query_aabb_group,
+                    dim=num_groups,
+                    inputs=[bvh.id, query_lower, query_upper, group_ids],
+                    outputs=[hits],
+                    device=device,
+                )
+                np.testing.assert_array_equal(hits.numpy(), np.ones(num_bounds, dtype=np.int32))
+
+                if iteration and not device.is_cpu:
+                    del capture
+
+
 def test_heterogeneous_group_sizes(test, device):
     rng = np.random.default_rng(123)
 
@@ -668,6 +723,12 @@ add_function_test(TestGroupedBvh, "test_grouped_bvh_ray", test_bvh_query_ray, de
 add_function_test(TestGroupedBvh, "test_grouped_ray_hits_single_bound", test_ray_hits_single_bound, devices=devices)
 add_function_test(TestGroupedBvh, "test_heterogeneous_group_sizes", test_heterogeneous_group_sizes, devices=devices)
 add_function_test(TestGroupedBvh, "test_sparse_group_root_isolation", test_sparse_group_root_isolation, devices=devices)
+add_function_test(
+    TestGroupedBvh,
+    "test_grouped_refit_translated_bounds",
+    test_grouped_refit_translated_bounds,
+    devices=devices + [device for device in wp.get_devices() if device.is_sycl and device not in devices],
+)
 
 add_function_test(
     TestGroupedBvh,

@@ -4059,11 +4059,18 @@ class array(Array[DType, NDim]):
 
         return self._array_interface
 
-    def __dlpack__(self, stream=None):
+    def __dlpack__(self, stream=None, *, max_version=None, dl_device=None, copy=None):
         # See https://data-apis.org/array-api/2022.12/API_specification/generated/array_api.array.__dlpack__.html
 
         if self.device is None:
             raise RuntimeError("Array has no device assigned")
+        if copy is True:
+            raise BufferError("Warp DLPack export only supports zero-copy sharing")
+        if dl_device is not None and tuple(dl_device) != self.__dlpack_device__():
+            raise BufferError("Warp DLPack export cannot copy to a different device")
+
+        if self.device.is_sycl:
+            return warp._src.dlpack.to_dlpack(self, stream=stream)
 
         # check if synchronization is needed
         if stream != -1:
@@ -4096,7 +4103,7 @@ class array(Array[DType, NDim]):
             raise RuntimeError("Array has no device assigned")
 
         if self.device.is_sycl:
-            raise NotImplementedError("SYCL DLPack interoperability is not yet supported")
+            return (warp._src.dlpack.DLDeviceType.kDLOneAPI, self.device.ordinal)
         if self.device.is_cuda:
             return (warp._src.dlpack.DLDeviceType.kDLCUDA, self.device.ordinal)
         elif self.pinned:

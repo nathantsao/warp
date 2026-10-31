@@ -134,6 +134,7 @@ void TopDownBVHBuilder::build_with_groups(BVH& bvh, const vec3* lowers, const ve
 
     std::vector<int> group_indices(num_groups);
     std::vector<int> group_leaf_node_index(num_groups, -1);
+    std::vector<int> group_leaf_depth(num_groups);
     std::vector<vec3> group_lowers(num_groups), group_uppers(num_groups);
 
     // 2. Find the bounds of each group
@@ -173,6 +174,7 @@ void TopDownBVHBuilder::build_with_groups(BVH& bvh, const vec3* lowers, const ve
             bvh.node_uppers[node_index] = make_node(b.upper, prim_end, false);
             bvh.node_parents[node_index] = parent;
             group_leaf_node_index[g] = node_index;
+            group_leaf_depth[g] = depth;
             return node_index;
         }
 
@@ -205,7 +207,7 @@ void TopDownBVHBuilder::build_with_groups(BVH& bvh, const vec3* lowers, const ve
         int prim_end = bvh.node_uppers[node].i;
         // Replace this packed leaf with a full subtree over [prim_start, prim_end)
         bvh.node_lowers[node].b = 0;
-        build_recursive(bvh, lowers, uppers, prim_start, prim_end, 0, bvh.node_parents[node], node);
+        build_recursive(bvh, lowers, uppers, prim_start, prim_end, group_leaf_depth[g], bvh.node_parents[node], node);
     }
 
     // 5. Reorder the tree so that all the leaf nodes are stored in the front

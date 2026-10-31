@@ -18,10 +18,14 @@
 extern "C" {
 WP_API int wp_sycl_init();
 WP_API const char* wp_sycl_version();
+WP_API int wp_sycl_runtime_check(int compiler_version, int cxx11_abi);
 WP_API const char* wp_sycl_get_error_string();
 WP_API void wp_sycl_set_error_string(const char* message);
 WP_API int wp_sycl_device_count();
 WP_API void* wp_sycl_device_get(int ordinal);
+WP_API void* wp_sycl_device_from_queue(void* queue);
+WP_API void* wp_sycl_device_from_pointer(const void* ptr);
+WP_API int wp_sycl_pointer_check(void* device, const void* ptr);
 WP_API const char* wp_sycl_device_name(void* device);
 WP_API size_t wp_sycl_device_max_work_group_size(void* device);
 WP_API size_t wp_sycl_device_local_memory_size(void* device);
@@ -54,6 +58,10 @@ WP_API int wp_sycl_array_scan(
 WP_API void* wp_sycl_stage_args(void* device, const void* src, size_t size);
 WP_API void* wp_sycl_scratch(void* device, size_t size);
 WP_API void* wp_sycl_stream_create(void* device);
+WP_API void* wp_sycl_stream_from_queue(void* device, void* queue);
+WP_API void* wp_sycl_stream_queue(void* stream);
+WP_API int wp_sycl_queue_matches_stream(void* device, void* queue, void* stream);
+WP_API int wp_sycl_queue_wait_stream(void* device, void* queue, void* stream);
 WP_API void* wp_sycl_stream_default(void* device);
 WP_API void* wp_sycl_stream_current(void* device);
 WP_API int wp_sycl_stream_destroy(void* device, void* stream);

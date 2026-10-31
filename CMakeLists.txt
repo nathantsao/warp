@@ -97,6 +97,7 @@ if(WARP_ENABLE_SYCL)
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${WARP_BIN_DIR}"
         COMMAND "${WARP_SYCL_COMPILER}" -fsycl -std=c++17 -fPIC -shared
                 -fvisibility=hidden -DWP_BUILD_DLL
+                "$<IF:$<CONFIG:Debug>,-g,-DNDEBUG>"
                 "$<IF:$<CONFIG:Debug>,-O0,-O2>"
                 "${WARP_NATIVE_DIR}/warp_sycl.cpp"
                 "${WARP_NATIVE_DIR}/bvh_sycl.cpp"
@@ -104,7 +105,7 @@ if(WARP_ENABLE_SYCL)
                 "${WARP_NATIVE_DIR}/scan_sycl.cpp"
                 "${WARP_NATIVE_DIR}/sort_sycl.cpp"
                 "${WARP_NATIVE_DIR}/texture_sycl.cpp"
-                "-L${WARP_BIN_DIR}" -l:warp.so -lze_loader "-Wl,-rpath,$ORIGIN"
+                -L "${WARP_BIN_DIR}" -l:warp.so -lze_loader "-Wl,-rpath,$ORIGIN"
                 -o "${WARP_BIN_DIR}/warp-sycl.so"
         DEPENDS warp ${WARP_SYCL_HEADERS}
                 "${WARP_NATIVE_DIR}/warp_sycl.cpp"

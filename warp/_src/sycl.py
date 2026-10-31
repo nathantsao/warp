@@ -20,9 +20,13 @@ def register_functions(library) -> None:
     signatures = {
         "init": (integer, []),
         "version": (string, []),
+        "runtime_check": (integer, [integer, integer]),
         "get_error_string": (string, []),
         "device_count": (integer, []),
         "device_get": (ptr, [integer]),
+        "device_from_queue": (ptr, [ptr]),
+        "device_from_pointer": (ptr, [ptr]),
+        "pointer_check": (integer, [ptr, ptr]),
         "device_name": (string, [ptr]),
         "device_max_work_group_size": (size, [ptr]),
         "device_local_memory_size": (size, [ptr]),
@@ -38,6 +42,10 @@ def register_functions(library) -> None:
         "memtile": (integer, [ptr, ptr, ptr, size, size]),
         "stage_args": (ptr, [ptr, ptr, size]),
         "stream_create": (ptr, [ptr]),
+        "stream_from_queue": (ptr, [ptr, ptr]),
+        "stream_queue": (ptr, [ptr]),
+        "queue_matches_stream": (integer, [ptr, ptr, ptr]),
+        "queue_wait_stream": (integer, [ptr, ptr, ptr]),
         "stream_default": (ptr, [ptr]),
         "stream_current": (ptr, [ptr]),
         "stream_destroy": (integer, [ptr, ptr]),
@@ -89,6 +97,34 @@ def register_functions(library) -> None:
 def check(library, result: int) -> None:
     if result:
         raise RuntimeError(f"Warp SYCL error: {library.wp_sycl_get_error_string().decode('utf-8')}")
+
+
+def prepare_dlpack_export(wp_array, queue: int | None) -> None:
+    """Order and retain a consumer queue until the exported allocation can be freed."""
+    from warp._src.context import Stream  # noqa: PLC0415
+
+    if queue is None or (isinstance(queue, int) and queue == -1):
+        raise BufferError(
+            "SYCL DLPack export requires an explicit consumer queue; use warp.to_torch() or pass stream=<sycl::queue*>"
+        )
+    if isinstance(queue, bool) or not isinstance(queue, int) or queue <= 0:
+        raise TypeError("DLPack stream must be a positive integer SYCL queue pointer")
+
+    device = wp_array.device
+    library = device.runtime.sycl
+    check(library, library.wp_sycl_queue_wait_stream(device.context, queue, device.stream.sycl_stream))
+
+    consumers = getattr(wp_array, "_dlpack_consumers", None)
+    if consumers is None:
+        consumers = wp_array._dlpack_consumers = []
+    for consumer in consumers:
+        matches = library.wp_sycl_queue_matches_stream(device.context, queue, consumer.sycl_stream)
+        if matches < 0:
+            check(library, matches)
+        if matches:
+            return
+    # Compare queue identities, not external object addresses, which can be reused.
+    consumers.append(Stream(device, sycl_queue=queue))
 
 
 def _resource_refs(value):

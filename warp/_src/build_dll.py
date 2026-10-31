@@ -1017,6 +1017,8 @@ def build_dll(args, dll_path, cpp_paths, cu_paths, libs=None):
 
 
 def build_sycl_runtime(output: str, mode: str = "release") -> None:
+    if mode not in ("debug", "release"):
+        raise ValueError(f"Unsupported SYCL runtime build mode: {mode}")
     native = pathlib.Path(__file__).resolve().parents[1] / "native"
     run_sycl_compiler(
         [
@@ -1027,7 +1029,7 @@ def build_sycl_runtime(output: str, mode: str = "release") -> None:
             "-shared",
             "-fvisibility=hidden",
             "-DWP_BUILD_DLL",
-            *(() if mode == "debug" else ("-DNDEBUG",)),
+            "-g" if mode == "debug" else "-DNDEBUG",
             "-O0" if mode == "debug" else "-O2",
             str(native / "warp_sycl.cpp"),
             str(native / "bvh_sycl.cpp"),

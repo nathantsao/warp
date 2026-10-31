@@ -43,7 +43,8 @@ from PyTorch's CUDA caching allocator, see
 Stream Conversion
 -----------------
 
-To convert a PyTorch CUDA stream to a Warp CUDA stream and vice versa, Warp provides the following functions:
+To convert a PyTorch CUDA stream or XPU queue to a Warp stream and vice versa,
+Warp provides the following functions:
 
 * :func:`warp.stream_from_torch`
 * :func:`warp.stream_to_torch`
@@ -53,6 +54,89 @@ with ``torch.cuda.Stream()`` are non-blocking. Streams created by Warp are
 blocking. Converting a stream between frameworks preserves its blocking
 behavior. For a detailed explanation and its implications, see
 :ref:`nonblocking_streams`.
+
+Intel XPU and SYCL
+-----------------
+
+PyTorch's ``xpu:N`` and Warp's ``sycl:N`` identifiers are separate namespaces.
+Use :func:`warp.device_from_torch` and :func:`warp.device_to_torch`, not string
+replacement or ordinal matching. The bridge matches the native physical device
+and verifies that the queues share the platform default SYCL context.
+Both libraries must use the same oneAPI compiler major/minor, a compatible C++
+standard-library ABI, and a single ABI-compatible ``libsycl`` runtime.
+Incompatible devices, contexts, runtimes, and out-of-order queues raise errors.
+
+The array helpers and DLPack support zero-copy oneAPI USM sharing, including
+strided arrays, vector/matrix types, and empty arrays. Converted views retain
+their allocation owners. Empty exports retain a minimal USM allocation because
+oneAPI consumers may determine device identity from the allocation pointer.
+Legacy oneAPI capsule imports identify nonempty allocations using the SYCL
+runtime, not the capsule's ordinal. For an empty legacy capsule or an external
+producer without a mapped device, pass ``device=`` to :func:`warp.from_dlpack`.
+An external producer must honor the supplied consumer queue when exporting.
+
+Array conversion establishes dependencies for previously submitted work. It
+does not automatically order future accesses to a cached view. Run both
+frameworks on a shared queue, or establish new stream dependencies whenever
+ownership of execution crosses frameworks:
+
+.. code:: python
+
+    import torch
+    import warp as wp
+
+    @wp.kernel
+    def scale(a: wp.array[float], s: float):
+        i = wp.tid()
+        a[i] *= s
+
+    torch_device = torch.device("xpu:0")
+    warp_device = wp.device_from_torch(torch_device)
+    torch_stream = torch.xpu.Stream(device=torch_device)
+    warp_stream = wp.stream_from_torch(torch_stream)
+
+    with torch.xpu.stream(torch_stream), wp.ScopedStream(warp_stream):
+        tensor = torch.zeros(1024, device=torch_device)
+        array = wp.from_torch(tensor)
+        tensor.fill_(3.0)
+        wp.launch(scale, dim=array.size, inputs=[array, 2.0], device=warp_device)
+        result = wp.to_torch(array)
+
+``stream_from_torch`` owns a copy of the SYCL queue and retains the Torch stream.
+``stream_to_torch`` retains the owning Warp stream. The same shared-queue pattern
+applies to ordinary SYCL graph capture and replay; conditional graphs and external
+PyTorch graph capture are separate capabilities. Check
+:attr:`warp.Device.supports_graph_capture` before capturing.
+
+SYCL exports require the consumer's ``sycl::queue*`` as a positive integer
+``stream``. Both ``array.__dlpack__(stream=queue)`` and
+``wp.to_dlpack(array, stream=queue)`` establish producer-to-consumer ordering and
+retain a copy of that queue until storage can be freed safely. Queue aliases
+share one retained consumer. Every additional consuming queue must also be
+registered through an export or ordered before a retained consumer completes.
+
+``stream=None`` and ``stream=-1`` raise ``BufferError`` for SYCL exports:
+producer synchronization alone cannot protect storage from later asynchronous
+consumer work. In particular, Torch versions that omit the oneAPI consumer
+stream cannot use ``torch.from_dlpack(warp_array)`` directly. Prefer
+:func:`warp.to_torch`, which supplies the current Torch queue automatically:
+
+.. code:: python
+
+    tensor = wp.to_torch(array)
+
+    # Explicit capsule export for the current XPU consumer queue:
+    queue = torch.xpu.current_stream(wp.device_to_torch(array.device)).sycl_queue
+    tensor = torch.from_dlpack(wp.to_dlpack(array, stream=queue))
+
+These are zero-copy paths; CPU/CUDA DLPack behavior is unchanged. Cross-queue
+exports during SYCL graph capture are rejected; use the shared capturing queue.
+
+Ordinary Warp timing events work on imported XPU queues through SYCL profiling
+tags, even when the queue lacks ``enable_profiling``, provided the device has
+``ext_oneapi_queue_profiling_tag``. Otherwise a timing record requires a
+profiling-enabled queue and fails explicitly when unsupported. Captured timing
+has the separate :attr:`warp.Device.is_graph_capture_event_supported` requirement.
 
 .. _pytorch-graph-capture:
 

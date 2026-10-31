@@ -106,6 +106,9 @@ def _device_to_dlpack(wp_device: warp._src.context.Device) -> DLDevice:
     elif wp_device.is_cuda:
         dl_device.device_type = DLDeviceType.kDLCUDA
         dl_device.device_id = wp_device.ordinal
+    elif wp_device.is_sycl:
+        dl_device.device_type = DLDeviceType.kDLOneAPI
+        dl_device.device_id = wp_device.ordinal
     else:
         raise RuntimeError(f"Invalid device type converting to DLPack: {wp_device}")
 
@@ -187,12 +190,31 @@ def dtype_from_dlpack(dl_dtype):
         raise RuntimeError(f"Unknown DLPack datatype {dl_dtype}")
 
 
-def device_from_dlpack(dl_device):
+def device_from_dlpack(dl_device, *, data=None, device=None):
     if warp._src.context.runtime is None:
         raise RuntimeError(
             "DLPack device conversion requires an initialized Warp runtime, got runtime=None. Call wp.init() first"
         )
 
+    if dl_device.device_type.value == DLDeviceType.kDLOneAPI:
+        from warp._src.sycl import check  # noqa: PLC0415
+
+        runtime = warp._src.context.runtime
+        if runtime.sycl is None:
+            raise RuntimeError("oneAPI DLPack import requires the Warp SYCL runtime")
+        if device is not None:
+            device = warp.get_device(device)
+            if not device.is_sycl:
+                raise ValueError("oneAPI DLPack import requires a SYCL device")
+            check(runtime.sycl, runtime.sycl.wp_sycl_pointer_check(device.context, data))
+            return device
+        context = runtime.sycl.wp_sycl_device_from_pointer(data)
+        if context is None:
+            check(runtime.sycl, -1)
+        for candidate in runtime.sycl_devices:
+            if candidate.context == context:
+                return candidate
+        raise RuntimeError("No Warp SYCL device is registered for the oneAPI allocation")
     if dl_device.device_type.value == DLDeviceType.kDLCPU or dl_device.device_type.value == DLDeviceType.kDLCUDAHost:
         return warp._src.context.runtime.cpu_device
     elif (
@@ -219,23 +241,30 @@ def strides_to_dlpack(strides, dtype):
     return a
 
 
-def to_dlpack(wp_array: warp.array):
+def to_dlpack(wp_array: warp.array, *, stream: int | None = None):
     """Convert a Warp array to another type of DLPack-compatible array.
 
     Args:
         wp_array: The source Warp array that will be converted.
+        stream: The consuming ``sycl::queue*``, as a positive integer. Required for
+            SYCL exports to establish ordering and retain the consumer queue until
+            storage can be freed. Not supported for CPU or CUDA capsule exports.
 
     Returns:
         A capsule containing a DLManagedTensor that can be converted
         to another array type without copying the underlying memory.
     """
 
-    if wp_array.device.is_sycl:
-        raise NotImplementedError("SYCL DLPack interoperability is not yet supported")
-
     # DLPack does not support structured arrays
     if isinstance(wp_array.dtype, warp._src.codegen.Struct):
         raise RuntimeError("Cannot convert structured Warp arrays to DLPack.")
+
+    if wp_array.device.is_sycl:
+        from warp._src.sycl import prepare_dlpack_export  # noqa: PLC0415
+
+        prepare_dlpack_export(wp_array, stream)
+    elif stream is not None:
+        raise ValueError("An explicit consumer queue is only supported for SYCL DLPack exports")
 
     # handle vector types
     if hasattr(wp_array.dtype, "_wp_scalar_type_"):
@@ -259,6 +288,14 @@ def to_dlpack(wp_array: warp.array):
     else:
         dl_device = _device_to_dlpack(wp_array.device)
 
+    data = wp_array.ptr
+    if wp_array.device.is_sycl and not data:
+        # oneAPI consumers infer the device from USM, even for an empty tensor.
+        storage = getattr(wp_array, "_dlpack_empty_storage", None)
+        if storage is None:
+            storage = wp_array._dlpack_empty_storage = warp.empty(1, dtype=warp.uint8, device=wp_array.device)
+        data = storage.ptr
+
     # allocate DLManagedTensor, shape, and strides together
     managed_tensor_size = ctypes.sizeof(DLManagedTensor)
     padding = managed_tensor_size & 7
@@ -272,7 +309,7 @@ def to_dlpack(wp_array: warp.array):
 
     # set managed tensor attributes
     managed_tensor = DLManagedTensor.from_address(mem_ptr)
-    managed_tensor.dl_tensor.data = wp_array.ptr
+    managed_tensor.dl_tensor.data = data
     managed_tensor.dl_tensor.device = dl_device
     managed_tensor.dl_tensor.ndim = target_ndim
     managed_tensor.dl_tensor.dtype = dtype_to_dlpack(target_dtype)
@@ -357,8 +394,9 @@ def _dtype_name(dl_dtype: DLDataType) -> str:
     return name
 
 
-def _unpack_array(dlt: DLTensor, dtype=None):
-    device = device_from_dlpack(dlt.device)
+def _unpack_array(dlt: DLTensor, dtype=None, device=None):
+    ptr = dlt.data + dlt.byte_offset if dlt.data else None
+    device = device_from_dlpack(dlt.device, data=ptr, device=device)
     pinned = dlt.device.device_type.value == DLDeviceType.kDLCUDAHost
     shape = tuple(dlt.shape[dim] for dim in range(dlt.ndim))
 
@@ -414,7 +452,7 @@ def _unpack_array(dlt: DLTensor, dtype=None):
         )
 
     a = warp._src.types.array(
-        ptr=dlt.data, dtype=dtype, shape=shape, strides=strides, copy=False, device=device, pinned=pinned
+        ptr=ptr, dtype=dtype, shape=shape, strides=strides, copy=False, device=device, pinned=pinned
     )
 
     return a
@@ -426,7 +464,7 @@ def _unpack_texture(dlt: DLTensor, TextureClass: type):
     return TextureClass(cuda_array=dlt.data, device=device)
 
 
-def _from_dlpack(capsule, dtype=None, hint=None) -> warp.array | warp.Texture:
+def _from_dlpack(capsule, dtype=None, hint=None, device=None) -> warp.array | warp.Texture:
     """Convert a DLPack capsule into a Warp array without copying.
 
     Args:
@@ -448,9 +486,12 @@ def _from_dlpack(capsule, dtype=None, hint=None) -> warp.array | warp.Texture:
 
     dlt = managed_tensor.dl_tensor
 
+    if device is not None and dlt.device.device_type.value != DLDeviceType.kDLOneAPI:
+        raise ValueError("An explicit SYCL device is only supported for oneAPI DLPack imports")
+
     if dlt.dtype.type_code.value != DLDataTypeCode.kDLOpaquePointer:
         # regular array
-        obj = _unpack_array(dlt, dtype=dtype)
+        obj = _unpack_array(dlt, dtype=dtype, device=device)
     else:
         # opaque pointers need a hint to interpret them correctly
         if hint in (warp.Texture1D, warp.Texture2D, warp.Texture3D):
@@ -467,7 +508,7 @@ def _from_dlpack(capsule, dtype=None, hint=None) -> warp.array | warp.Texture:
     return obj
 
 
-def from_dlpack(source, dtype=None, hint=None) -> warp.array | warp.Texture:
+def from_dlpack(source, dtype=None, hint=None, *, device=None) -> warp.array | warp.Texture:
     """Convert a source array or DLPack capsule into a Warp array without copying.
 
     Args:
@@ -477,6 +518,9 @@ def from_dlpack(source, dtype=None, hint=None) -> warp.array | warp.Texture:
             ``wp.Texture1D``, ``wp.Texture2D``, and ``wp.Texture3D`` when the opaque
             pointer is a ``cudaArray_t`` handle. Hints are ignored when the data type
             is not ``kDLOpaquePointer``.
+        device: An explicit SYCL device for oneAPI sources whose device identity cannot
+            be inferred, including empty legacy capsules. Nonempty oneAPI allocations
+            are validated against the device's SYCL context rather than matching ordinals.
 
     Returns:
         A new Warp array or texture that uses the same underlying memory as the source.
@@ -484,27 +528,52 @@ def from_dlpack(source, dtype=None, hint=None) -> warp.array | warp.Texture:
 
     # See https://data-apis.org/array-api/2022.12/API_specification/generated/array_api.array.__dlpack__.html
 
+    interop_streams = None
     if hasattr(source, "__dlpack__"):
         device_type, device_id = source.__dlpack_device__()
         # Check if the source lives on a CUDA device
         if device_type in (DLDeviceType.kDLCUDA, DLDeviceType.kDLCUDAManaged):
             # Assume that the caller will use the array on its device's current stream.
             # Note that we pass 1 for the null stream, per DLPack spec.
-            cuda_stream = warp.get_cuda_device(device_id).stream.cuda_stream or 1
+            consumer_stream = warp.get_cuda_device(device_id).stream.cuda_stream or 1
         elif device_type == DLDeviceType.kDLCPU:
             # No stream sync for CPU arrays.
-            cuda_stream = None
+            consumer_stream = None
         elif device_type == DLDeviceType.kDLCUDAHost:
             # For pinned memory, we sync with the current CUDA device's stream.
             # Note that we pass 1 for the null stream, per DLPack spec.
-            cuda_stream = warp.get_cuda_device().stream.cuda_stream or 1
+            consumer_stream = warp.get_cuda_device().stream.cuda_stream or 1
+        elif device_type == DLDeviceType.kDLOneAPI:
+            source_device = getattr(source, "device", None)
+            if getattr(source_device, "type", None) == "xpu":
+                from warp._src.torch import _prepare_xpu_tensor  # noqa: PLC0415
+
+                inferred_device = warp.device_from_torch(source_device)
+                if device is not None and warp.get_device(device) != inferred_device:
+                    raise ValueError("The requested SYCL device does not match the Torch XPU allocation")
+                device = inferred_device
+                interop_streams = _prepare_xpu_tensor(source, device)
+                # PyTorch's XPU producer does not implement stream synchronization.
+                consumer_stream = -1
+            else:
+                if device is None and isinstance(source_device, warp.Device):
+                    device = source_device
+                if device is None:
+                    raise ValueError("oneAPI DLPack sources without a mapped device require an explicit SYCL device")
+                device = warp.get_device(device)
+                if not device.is_sycl:
+                    raise ValueError("oneAPI DLPack import requires a SYCL device")
+                consumer_stream = device.stream.sycl_queue
         else:
             raise TypeError(f"Unsupported source device for DLPack: device_type={device_type}, device_id={device_id}")
 
-        capsule = source.__dlpack__(stream=cuda_stream)
+        capsule = source.__dlpack__(stream=consumer_stream)
 
     else:
         # legacy behaviour, assume source is a capsule
         capsule = source
 
-    return _from_dlpack(capsule, dtype=dtype, hint=hint)
+    obj = _from_dlpack(capsule, dtype=dtype, hint=hint, device=device)
+    if interop_streams is not None:
+        obj._interop_streams = interop_streams
+    return obj

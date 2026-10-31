@@ -19,6 +19,7 @@ reference, not a source-compatible patch for this version.
 | --- | --- |
 | Add explicit `Device.backend` / `is_sycl` and `sycl:N` devices. | Keep CPU and CUDA dispatch truthful; preserve existing default-device selection. |
 | Build an optional `warp-sycl.so` with `icpx`, from both build frontends. | Keep oneAPI dependencies out of ordinary CPU/CUDA builds. |
+| Keep explicit companion build definitions in CMake and Python, with a build-parity regression. | Follow the existing build layout while detecting drift in source lists, release assertions, debug information and linker flags. |
 | Enumerate Intel Level Zero GPUs and own one in-order queue per device. | Avoid duplicate OpenCL devices and preserve operation ordering without pretending queues are CUDA streams. |
 | Use device USM for arrays and checked native allocation/copy/fill/synchronization APIs. | Avoid accidental host dereferences; report SYCL exceptions through Warp's Python error path. |
 | Reuse Warp's module builder, argument descriptors, and generated forward/backward bodies. | Add a launch backend rather than duplicating the compiler or exposing Python replicas of native layouts. |
@@ -54,6 +55,10 @@ reference, not a source-compatible patch for this version.
 
 - Linux Intel Level Zero GPUs; validated with oneAPI 2026.1.1 on Arc Pro B70.
 - Streams and events (`wp.Stream`, `wp.Event`, `wp.ScopedStream`, event timing), with per-stream ordering.
+- Imported in-order SYCL queues and Torch XPU zero-copy arrays, with physical
+  device/context/ABI validation and retained consumer queues.
+- oneAPI DLPack imports and explicit-consumer-queue exports, including empty,
+  strided, vector and matrix arrays. Streamless SYCL exports are rejected.
 - Regular contiguous/strided Warp arrays, explicit CPU transfers, kernel launches,
   scalar/vector operations, atomics, and generated reverse-mode kernels.
 - Basic tile load/store, elementwise map, reduction, scan and sort paths; tile-map/sum
@@ -69,6 +74,62 @@ reference, not a source-compatible patch for this version.
   capture checks device support at runtime.
 - Nested event timing in native-recording graphs with Level Zero v2. Timing events
   are automatically external, matching CUDA's public recording API.
+
+### Current capability contract
+
+This matrix is the authoritative current support summary. Detailed sections
+explain the implementations; the qualification logs below record historical
+checkouts and must not be interpreted as current test totals.
+
+| Surface | Current contract / capability | Regression coverage |
+| --- | --- | --- |
+| Device and kernel execution | Linux Intel Level Zero GPUs, explicit `sycl:N` identity, device USM, shared codegen and autodiff. Query device limits, FP64 and atomic64 support rather than assuming them. | [SYCL tests](../warp/tests/test_sycl.py) |
+| Work-group collectives | Uniform collective control flow; supported tile load/store, map, reduction and scan paths include partial logical groups. `tile_sort` still requires complete logical groups. No fixed 32-lane subgroup assumption. | Partial-tile, scan, sort and gradient cases in [SYCL tests](../warp/tests/test_sycl.py) |
+| External queues / Torch | In-order queues on the same physical device and platform-default context; compatible oneAPI/C++ ABI. Imported streams own queue copies; no implicit CUDA default-stream ordering. | [XPU interop](../warp/tests/interop/test_torch_xpu.py) |
+| oneAPI DLPack | Zero-copy imports; exports require a positive consumer queue pointer through `__dlpack__` or `to_dlpack(..., stream=...)`. The export retains canonical consumer queues through retirement. `None` and `-1` exports are rejected, including legacy capsule exports without an explicit queue. | Queue aliases, explicit rejection, empty/strided/compound types and asynchronous last-owner teardown in [XPU interop](../warp/tests/interop/test_torch_xpu.py) |
+| Ordinary event timing | Profiling tags support imported queues when `ext_oneapi_queue_profiling_tag` is available; otherwise the queue must have `enable_profiling`. Unsupported timing fails at recording, not elapsed-time retrieval. | Owned/imported/cross-queue timing in [XPU interop](../warp/tests/interop/test_torch_xpu.py) and [SYCL events](../warp/tests/test_sycl.py) |
+| Ordinary graphs | Check `Device.supports_graph_capture`; retain one recording queue and captured resources. | Graph allocation, module, stream and resource lifetimes in [SYCL tests](../warp/tests/test_sycl.py) |
+| Replay-visible captured events | Check `Device.is_graph_capture_event_supported` independently; supported native-recording v2 immediate queues use graph-owned host-USM timestamp samples. Host waits complete the containing graph. | Captured/mixed timing, nested replay and unsupported-adapter cases in [SYCL tests](../warp/tests/test_sycl.py) |
+| Conditional / multistream graphs | Not implemented: `Device.is_conditional_graph_supported` is false. Foreign event import, cross-graph external waits and external PyTorch graph capture are separate unsupported contracts. | Explicit rejection cases in [SYCL tests](../warp/tests/test_sycl.py) |
+| Geometry | Explicit host SAH/median construction; ordinary GPU refit; winding-number refit has a synchronous host portion. No topology mutation while retained by a graph. | [Grouped BVHs](../warp/tests/geometry/test_grouped_bvh.py) and [SYCL geometry](../warp/tests/test_sycl.py) |
+| Textures | Single-level RGBA32F 2D hardware sampling; query addressing capabilities. Other dimensions/formats/surfaces are rejected. | Texture copies, arrays, nested structs, graphs and lifetime cases in [SYCL tests](../warp/tests/test_sycl.py) |
+| Array utilities / matrix tiles | Native asynchronous scan and sorts; portable matrix tile arithmetic, not XMX/oneMKL. Array-wide reductions, run-length encoding and tile FFT are unsupported. | Shared utility tests registered in [SYCL tests](../warp/tests/test_sycl.py) |
+| MuJoCo benchmarking | Capture selection accounts for event tracing before recording. Eager warm-up restores nested data/render array contents from host snapshots outside rollout measurement/tracing; each eager step owns a fresh tracer. Captured replay retains its original event recordings. | [CLI regressions](../../mujoco_warp/mujoco_warp/_src/cli_test.py): frozen controls, heterogeneous worlds, Euler/RK4 and unchanged MuJoCo tolerances; runnable with CPU/CUDA/SYCL device selection. |
+| Companion builds | Explicit definitions in [CMake](../CMakeLists.txt) and [Python](../warp/_src/build_dll.py): Release `-O2 -DNDEBUG`, Debug `-O0 -g`, identical source/link inputs. | [Build-contract test](../tools/ci/test_sycl_build.py), which builds the CPU core and companion through the root CMake project in isolated source copies for both modes, then compares actual companion arguments with the Python builder. |
+
+### Compiler workaround lifecycle
+
+`collision_gjk._polygon_clip` retains its SYCL-only noinline override. The
+observed affected stack is Arc Pro B70, DPC++ 2026.1.1 and IGC 2.40.13; this is
+an observed configuration, not an asserted range of affected compiler releases.
+CPU/CUDA inlining and process-wide IGC settings remain unchanged.
+
+The smallest checked-in end-to-end reproduction is
+[`test_capsule_mesh_multiccd_shallow`](../../mujoco_warp/mujoco_warp/_src/collision_driver_test.py):
+one capsule above an eight-vertex cube mesh. Keep its full caller context:
+isolated clipping kernels did not reproduce the retry-IR corruption. There is
+not yet a minimized standalone compiler testcase or a verified upstream fix;
+the historical investigation below distinguishes observed IR from hypotheses.
+
+Before removing the override, change only that hint in an isolated checkout,
+use a fresh Warp kernel-cache directory, leave `IGC_DisableRecompilation` unset,
+and disable persistent driver caches. From the MuJoCo Warp checkout, run:
+
+```bash
+SYCL_CACHE_PERSISTENT=0 NEO_CACHE_PERSISTENT=0 uv run --no-sync python -m pytest \
+  mujoco_warp/_src/collision_driver_test.py --device sycl:0 \
+  --kernel_cache_dir=/path/to/fresh/isolated/warp-cache \
+  -k 'capsule_mesh_multiccd or cylinder_multiccd or box_box'
+```
+
+Run the same selection with the override restored, and with `--cpu` and an
+available CUDA device. Record the compiler/driver versions and exact failing
+case IDs. Removal requires all original contact counts, positions and distances
+to pass unchanged in both eager and captured execution, no box-box regression,
+and a reduced compiler reproducer or upstream fix identifying the affected
+optimization. Do not mask failures with skips, looser tolerances, global retry
+settings or alternate collision math. Upgrade the observed version record only
+after testing the replacement compiler.
 
 ### Bindless textures
 
@@ -169,12 +230,13 @@ There is **no automatic CPU fallback**. Geometry construction and winding refit
 are explicit synchronous host portions of supported operations. They cannot run
 during graph capture.
 
-This stage does not implement CUDA/SYCL direct copies, peer copies, external
-(interop) streams/events, capturing work from several streams, external event waits
+This stage does not implement CUDA/SYCL direct copies, peer copies, foreign
+event import, capturing work from several streams, external event waits
 between graphs, APIC serialization, conditional graphs, recorded `Launch` commands,
 deterministic lowering, custom module preambles/includes, floating-point
-verification, indexed arrays, volumes, hash grids, sparse matrices, or
-DLPack interoperability. Tile FFT is not enabled. Tile matrix
+verification, indexed arrays, volumes, hash grids, or sparse matrices.
+Queue imports and explicit-queue DLPack are supported under the contract above.
+Tile FFT is not enabled. Tile matrix
 multiplication, Cholesky and triangular solves use Warp's portable scalar
 implementations; no vendor matrix engine (XMX/oneMKL) is used yet.
 The native array-wide reductions (`array_sum`, `array_inner`) and `runlength_encode`
@@ -184,8 +246,9 @@ order `-0.0` before `+0.0`). Float scans sum in a different order, as on CUDA. I
 segment bounds are clamped rather than reported, so callers must validate them as on CUDA.
 
 Tile local-memory accounting is conservative and module-wide; exceeding device
-local memory raises an error. Tiled kernels require complete work-groups and
-uniform collective control flow. No subgroup width is requested or assumed.
+local memory raises an error. Tiled kernels require uniform collective control
+flow; supported partial logical groups use a smaller physical tail group.
+`tile_sort` still requires complete logical groups. No subgroup width is requested or assumed.
 Large non-contiguous fills and captured fills currently support elements of at
 most 256 bytes.
 
@@ -202,7 +265,11 @@ geometry is retained; recapture after those changes.
 - Replacing every CUDA name with SYCL: conflates streams, graphs, warps, and memory models.
 - Universal CPU fallback: cannot preserve asynchronous aliasing, gradient, and capture semantics.
 
-## MuJoCo Warp enablement
+## Historical MuJoCo Warp enablement
+
+The following investigation logs describe their stated revisions and runtime
+configurations, not a current release-support promise. Use the
+[current capability contract](#current-capability-contract) for supported APIs.
 
 [MuJoCo Warp](https://github.com/google-deepmind/mujoco_warp) (MJWarp, 3.16.0) is the
 first large external Warp codebase run on this backend. It is written against the CUDA
@@ -260,6 +327,10 @@ No MJWarp kernel was rewritten. The existing CPU suites still pass unchanged
 (705 tests across solver, smooth, constraint, forward, collision driver).
 
 ### Current status
+
+The bullets below describe the initial rigid-body baseline, not whole-port
+sign-off. See [latest qualification](#latest-qualification) for the current
+3.17 source checks and remaining failures.
 
 - Unmodified `mjw.forward` and `mjw.step` match MuJoCo for Newton and CG, pyramidal and
   elliptic cones, dense and sparse Jacobians, and Euler, implicit-fast and RK4 integrators.
@@ -426,7 +497,7 @@ before performance.
      passes for 32-bit keys), uncoalesced scatters, and segmented sorts that sort every
      element. Wider digits, a one-sweep scan, and per-segment small-sort kernels are options.
 
-## Testing Strategy
+## Historical testing strategy and evidence
 
 `warp.tests.test_sycl` exercises forward/backward kernels, contended atomics,
 half-word preservation, signed integer overflow, strides, geometry mutation,
@@ -581,7 +652,8 @@ compiler-chosen on CPU and CUDA. Overrides are validated, copied, included in
 stable cache hashes, and propagated to generic functions, adjoints and custom
 gradient/replay functions. See [function configuration](../docs/user_guide/configuration.rst).
 
-The current runs leave `IGC_DisableRecompilation` unset. The combined Warp and
+The following runs, recorded before the MJWarp 3.17 upstream update, leave
+`IGC_DisableRecompilation` unset. The combined Warp and
 focused GPU collision runs disable persistent caches to exercise compilation;
 the CPU and broad SYCL runs use normal cache settings:
 
@@ -605,11 +677,11 @@ Fresh-process checks verify that real Warp initialization does not set the IGC
 variable and preserves explicit `0`, `1` and empty-string settings. An explicit
 `1` can still reproduce the known box-box failure; leave it unset for normal
 retry. No compiler, driver or system package was changed, and the native Warp
-runtime was not rebuilt. Normal release/debug, math and optimization options
+runtime was not rebuilt for those focused runs. Normal release/debug, math and optimization options
 remain intact. Performance of the noinline hint has not yet been measured.
 
-This is not a completed physics qualification. The captured physics/reference
-checks cover three steps, not long integration. In the separate 1000-step
+Those captured physics/reference checks cover three steps, not long integration.
+In the separate historical 1000-step
 humanoid probe under the previous retry-disabled default, both 1024-world
 repeats had finite state and zero raw overflow flags, but the second exceeded
 the existing `atol=rtol=5e-4` repeat comparison: maximum absolute differences
@@ -617,8 +689,7 @@ were about `1.54e-3` in `qpos`, `1.32e-3` in `qvel` and `1.02e-2` in `qacc`.
 Captured and eager traces first differ at step 1 despite equal input states
 and contact multisets. Constraint-row ordering and constraint forces differ;
 both first-differing-world outputs pass the unchanged one-step CPU tolerance.
-Comparing all active constraint inputs up to row permutation and checking every
-world against CPU remain pending before changing the long-run criterion.
+The later all-world ordering and reference checks are recorded below.
 
 One separate historical 4096-world, 1000-step captured rollout was finite with
 all raw flags zero. It was one repeat, not ten, used the retry-disabled setting,
@@ -626,6 +697,204 @@ and ran alongside other tests, so it is neither current-default long-run
 qualification nor a performance measurement. The historical line-search
 exhaustion remains a separate investigation. The underlying compiler issue
 still needs minimization and a verified fix before removing the noinline hint.
+
+### Latest qualification
+
+These checks use MJWarp `f34c6dd` (3.17.0), MuJoCo
+`3.17.1.dev1008153370`, and the local Warp 1.18.0 source build on Arc Pro B70
+with DPC++ 2026.1.1. `IGC_DisableRecompilation` is unset; headless references
+use `MUJOCO_GL=egl`. The older nine-module 1001-pass/28-failure total above is
+not a fresh result for this upstream update. The refreshed focused source CPU
+compatibility selection has 67 passes and 24 failures; four formerly failing
+interpolated elastic2d cases now pass.
+
+**Grouped BVH fix.** The G1 integration check exposed a real SYCL refit defect.
+For the same saved 64-world geometry, CPU and SYCL primitive bounds, topology
+and group roots were identical, but the tree reported maximum depth 8 while
+its parent chains reached 14. Group expansion restarted the depth at zero.
+SYCL's level-wise refit therefore skipped the mesh leaves; brute-force rays
+hit the robot while BVH rays and both eager/captured rendering hit the floor.
+
+The shared SAH/median builder now preserves the group-leaf depth when expanding
+each subtree. The qualified G1 topology and refitted node bounds match the
+original correct CPU tree bit for bit; the existing query-stack depth guard
+also now uses the full grouped-tree depth. Physics and intersection math are
+unchanged. The native core and SYCL runtime were rebuilt. A generic translated-bounds regression
+fails before the fix and passes after it for leaf sizes 1/4, CPU/SYCL, eager
+refit and captured refit after rebuilding. The final rebuild also includes the
+concurrently added queue/interop ABI changes, with user approval; those features
+are not qualified by these MJWarp checks.
+
+| Check before the shifted-cost fix | Result |
+|---|---|
+| Warp BVH, grouped BVH and dedicated SYCL geometry selection | 29 passed, 3 no-CUDA skips; clean resource destruction |
+| Source MJWarp BVH, ray, render-utility and render selection | 146 passed, 1 CUDA-only graph test skipped |
+| G1 replay/render at 1, 2, 64, 1024 and 4096 worlds | Each completed 1000 controls and 100 captured refit/render frames with default backface culling; all layouts, finite-state, changing-image and 24 sampled CPU center-ray checks pass |
+
+The G1 ray maximum absolute depth error is `4.483e-7`, below the unchanged
+`atol=rtol=5e-4` threshold. Rendering success is not a clean physics sign-off:
+with the benchmark's unchanged 10 solver / 20 line-search limits, the per-step
+raw-flag monitor records the following counts of worlds that hit each limit:
+
+| Worlds | `ITERATIONS` | `LS_ITERATIONS` |
+|---|---|---|
+| 1 | 0 | 1 |
+| 2 | 0 | 0 |
+| 64 | 1 | 34 |
+| 1024 | 15 | 588 |
+| 4096 | 69 | 2314 |
+
+All other raw flags are zero and every state remains finite. A source CPU
+1000-control, one-world G1 replay also records `LS_ITERATIONS`. The probe does
+not inherit the benchmark's warning masks: it exits with failure for the four
+sizes that do not meet the stronger zero-raw-flags criterion.
+
+**Long humanoid reference/stability check, before the shifted-cost fix.** Ten captured 1000-step rollouts
+completed at each of 1024 and 4096 worlds. Every per-step finite-state check
+passes and every raw flag, including solver and line-search limits, is zero.
+The reference gate compares a MuJoCo one-step result from every world's saved
+pre-step inputs at steps 1, 10, 100, 500 and 1000, not an independent long CPU
+trajectory. Its absolute and relative tolerances both remain `5e-4`.
+
+| Worlds | Completed rollouts | Step-1 reference checks | Later reference checks | Maximum absolute `qacc` error |
+|---|---|---|---|---|
+| 1024 | 10 x 1000 steps | 10 pass | 40 fail in `qacc` only | `0.007485` |
+| 4096 | 10 x 1000 steps | 10 pass | 40 fail in `qacc` only | `0.008475` |
+
+`qpos`, `qvel` and time pass every reference checkpoint. Exact saved-state
+MJWarp CPU controls also fail the acceleration gate: at the 1024-world step-500
+and step-1000 snapshots, all worlds have at least one failing `qacc` element,
+with maximum errors `0.004662` and `0.004541`. This excludes an exclusively
+Intel or capture-only explanation, but does not turn the failed reference gate
+into a pass. The collecting probe completes
+all rollouts and deliberately exits nonzero for its 80 failed checkpoints.
+
+First-step diagnostics confirm identical reset inputs, contact multisets,
+mass matrices/factors and active mathematical constraint rows up to permutation
+in all 1024/4096 worlds, with all-world first-step reference agreement.
+Constraint ordering differs, but this is not proof that later drift is harmless.
+Strict long-horizon comparisons remain failed separately: across the repeats,
+maximum differences are about `0.002989` in `qpos`, `0.002557` in `qvel` and
+`0.011139` in `qacc`. Constraint-order determinism is not a remedy yet:
+MJWarp's `_sort_constraints` is still a stub. No tolerance, solver limit,
+determinism policy or physics algorithm was changed for acceptance.
+
+**Shifted-cost false-convergence repair.** Exact replay of the original
+4096-world worst case (world 2598, step 500, right-ankle DOF 14) exposed a
+separate SYCL fast-math problem. A redundant `quad0 - cost0` offset for an
+initially active unilateral row allowed the large baseline cost to contaminate
+the small shifted cost. A minimal device probe returned `5.3481344e-6` at
+alpha zero, where the shifted cost must be exactly zero; CPU returned zero.
+An improving Newton trial was consequently rejected and alpha zero caused the
+outer solver to stop without an overflow flag. The initial slope/noise guard
+was not responsible.
+
+MJWarp now selects the active row's exact zero offset directly in both cone
+paths and both single/triple trial evaluators. Fast math, stationary-point
+safeguards, stopping tolerances and iteration limits remain unchanged. The
+new backend-independent tests cover cost, gradient, Hessian, activation
+transitions and useful-step acceptance at 1, 2, 64, 1024 and 4096 worlds.
+The full solver suite passes **131 tests, one skip and two passed subtests
+on each of CPU and SYCL**; the focused SYCL numerical selection passes 29 tests.
+Ruff and the repository kernel analyzer pass.
+
+In the original full-batch replay, alpha changes from zero to `0.999935`.
+The selected acceleration changes from `0.00765125` to `0.00260908` rad/s²,
+versus the MuJoCo reference `-0.000823323`: error drops from `0.00847457`
+to `0.00343240`, but still fails the unchanged reference allowance. The
+FP64 diagnostic optimum of MJWarp's own rounded inputs is `0.00260307`;
+the repaired solver is within `2.05e-5` of that optimum across all selected
+world DOFs. This is a solver repair, not full reference-accuracy sign-off.
+
+**Remaining constraint-input precision.** CPU controls identify an independent
+input-precision limitation. The selected knee-limit distance error
+`-8.1236581e-8` rad comes entirely from converting the model's limit to
+float32; the subsequent subtraction adds no error in that example. Rounding
+only joint limits in a diagnostic double-precision MuJoCo model changes the
+selected acceleration by `0.000917194` rad/s², already greater than its
+approximately `0.000500412` allowance. That diagnostic does not change the
+qualification reference. Contact positions/transforms also differ at roughly
+`1e-7` m scale. Solving rounded constraints more accurately cannot recover
+information lost before the solver. A higher-precision input policy remains
+an explicit architectural decision. Per user direction, the upstream float32
+policy is retained: no higher-precision model, state, constraint or solver
+changes are included. FP64 and rounded-model experiments remain host-only
+session diagnostics, not changes to the qualification reference or runtime.
+The case decompositions do not establish the composition of every failed
+checkpoint.
+
+**Post-fix float32 requalification (2026-10-30).** The long humanoid and G1
+checks have now been repeated after the solver repair. Runtime dtype assertions
+confirm representative model, state, mass, constraint and solver arrays remain
+float32. Thirteen recorded source/model/native-library fingerprints remain
+unchanged across the qualification. No production code, compiler/runtime
+configuration, tolerance, iteration limit or dependency changes were made
+during this testing phase.
+
+Fresh forward/integrator/capture tests pass **29 tests and 14 subtests on
+SYCL**, including eager/captured and event-traced comparisons at 1, 2, 64,
+1024 and 4096 worlds. CPU controls pass **24 tests, five expected captured-event
+skips and 14 subtests**. These complement the full solver results above; their
+counts are not additive with earlier selections.
+
+All 20 post-fix captured humanoid rollouts complete 1000 steps, with finite
+state and zero raw flags at every step. The same saved-input MuJoCo reference
+gate, at unchanged `atol=rtol=5e-4`, still fails:
+
+| Worlds | Completed rollouts | Step-1 reference checks | Later reference checks | Maximum absolute `qacc` error |
+|---|---|---|---|---|
+| 1024 | 10 x 1000 steps | 10 pass | 40 fail in `qacc` only | `0.005184` |
+| 4096 | 10 x 1000 steps | 10 pass | 40 fail in `qacc` only | `0.004939` |
+
+`qpos`, `qvel` and time pass every reference checkpoint. No world in any of
+the 80 saved failed checkpoints returns its entire input `qacc_warmstart`
+unchanged. Strict long-horizon repeat comparisons fail separately, with
+maximum differences `0.002968` in `qpos`, `0.002509` in `qvel` and `0.011147`
+in `qacc`; time matches. The collecting probe completes all requested runs
+and deliberately exits nonzero rather than hiding these accuracy failures.
+
+The new worst component is the left ankle (`ankle_x_left`, DOF 20), at
+1024 worlds, repeat 1, step 500, world 416. Its error `0.005183999` exceeds
+the `0.000502050` allowance by `10.3257x`. A full-batch eager replay's
+host-only FP64 refinement attributes `0.005183446` to its rounded mathematical
+inputs; the selected acceleration needs only a `2.55e-6` solver correction.
+The maximum same-input correction across that world's DOFs is `2.11e-5`.
+Substituting aligned reference `J`, `D` and `aref` reduces maximum error to
+`8.54e-6`. This supports the input-precision diagnosis for this case without
+promoting the diagnostic's precision to production.
+
+Fresh exact-input CPU replays also fail the reference `qacc` gate: maximum
+error is `0.004857` for the original 4096-world worst-case snapshot and
+`0.005075` for the new 1024-world worst-case snapshot. Both have zero raw
+flags, one solver iteration per world and no unchanged whole-world warmstarts.
+A fresh captured SYCL replay of the original 4096-world snapshot likewise
+takes a useful step in every world and has zero raw flags, while its reference
+acceleration gate still fails. These controls exclude an exclusively Intel or
+capture-only explanation; they do not turn the failed reference gate into a pass.
+
+The post-fix G1 replay/render check completes 1000 controls and 100 captured
+RGB/depth/segmentation frames at every requested size, with default backface
+culling. All layouts and finite-state checks pass, 99 frames per size change
+from the first image, and all 24 sampled CPU center-ray depth/segmentation
+checks pass. Maximum depth error is `6.183e-7` m. All resource/capacity flags
+remain zero. With the unchanged 10 solver / 20 line-search limits, the
+stronger zero-raw-flags criterion now fails at all five sizes:
+
+| Worlds | `ITERATIONS` | `LS_ITERATIONS` |
+|---|---|---|
+| 1 | 0 | 1 |
+| 2 | 0 | 1 |
+| 64 | 1 | 29 |
+| 1024 | 8 | 593 |
+| 4096 | 57 | 2302 |
+
+CPU G1 controls also complete 1000 controls and 100 rendered frames at 1, 64
+and 1024 worlds, with finite state, correct sampled rays and no resource
+flags. They record line-search-limit flags in 1, 41 and 641 worlds,
+respectively, and no solver-limit flags. Limits were not raised and flags
+were not masked. Rendering and stability coverage pass, but the strict
+reference, repeatability and zero-raw-flags gates remain explicitly failed;
+this is not full physics sign-off.
 
 MJWarp itself is the integration test: `pytest --device sycl:0 -n 24` in `mujoco_warp`.
 

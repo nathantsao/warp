@@ -23,8 +23,11 @@
 
 #include <dlfcn.h>
 #include <level_zero/ze_api.h>
+#include <link.h>
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
 #include <sycl/ext/oneapi/experimental/graph.hpp>
+#include <sycl/ext/oneapi/experimental/profiling_tag.hpp>
+#include <sycl/version.hpp>
 
 namespace {
 
@@ -137,7 +140,8 @@ struct SyclFreeInfo {
 sycl::queue make_queue(const sycl::device& device)
 {
     return sycl::queue(
-        device, [](sycl::exception_list errors) { std::rethrow_exception(*errors.begin()); },
+        device.get_platform().khr_get_default_context(), device,
+        [](sycl::exception_list errors) { std::rethrow_exception(*errors.begin()); },
         sycl::property_list { sycl::property::queue::in_order(), sycl::property::queue::enable_profiling() }
     );
 }
@@ -177,14 +181,18 @@ struct SyclStream {
     {
         try {
             queue.wait_and_throw();
-        } catch (...) {
+        } catch (const std::exception& error) {
+            fprintf(stderr, "Warp SYCL stream synchronization during cleanup failed: %s\n", error.what());
         }
-        if (stage_host)
-            sycl::free(stage_host, queue);
-        if (stage_device)
-            sycl::free(stage_device, queue);
-        if (scratch)
-            sycl::free(scratch, queue);
+        for (void* ptr : std::array<void*, 3> { stage_host, stage_device, scratch }) {
+            if (!ptr)
+                continue;
+            try {
+                sycl::free(ptr, queue);
+            } catch (const std::exception& error) {
+                fprintf(stderr, "Warp SYCL stream storage cleanup failed: %s\n", error.what());
+            }
+        }
     }
 };
 
@@ -291,6 +299,23 @@ thread_local std::string last_error;
 
 SyclDevice& get_device(void* device) { return *static_cast<SyclDevice*>(device); }
 
+sycl::queue& external_queue(void* device, void* handle)
+{
+    if (!handle)
+        throw std::invalid_argument("An external SYCL queue pointer must not be null");
+    auto& queue = *static_cast<sycl::queue*>(handle);
+    auto& expected = get_device(device).default_stream->queue;
+    if (queue.get_backend() != sycl::backend::ext_oneapi_level_zero || queue.get_device() != expected.get_device())
+        throw std::runtime_error("The external SYCL queue belongs to a different physical device");
+    if (queue.get_context() != expected.get_context())
+        throw std::runtime_error(
+            "The external SYCL queue has an incompatible context; both libraries must use the platform default context"
+        );
+    if (!queue.is_in_order())
+        throw std::runtime_error("Warp requires an in-order external SYCL queue");
+    return queue;
+}
+
 void check_event_access(const SyclEvent& event)
 {
     if (get_device(event.device).capture)
@@ -385,6 +410,37 @@ void wp_sycl_set_error_string(const char* message) { last_error = message; }
 
 const char* wp_sycl_version() { return WP_VERSION_STRING; }
 
+int wp_sycl_runtime_check(int compiler_version, int cxx11_abi)
+{
+    return wp::sycl_checked([&] {
+        if (compiler_version / 100 != __INTEL_LLVM_COMPILER / 100)
+            throw std::runtime_error("Warp and the external library require the same oneAPI compiler major.minor");
+        if (cxx11_abi != _GLIBCXX_USE_CXX11_ABI)
+            throw std::runtime_error("Warp and the external library have incompatible C++ standard-library ABIs");
+        struct Libraries {
+            size_t count = 0;
+            bool compatible = true;
+        } libraries;
+        dl_iterate_phdr(
+            [](dl_phdr_info* info, size_t, void* data) {
+                auto& libraries = *static_cast<Libraries*>(data);
+                const char* name = std::strrchr(info->dlpi_name, '/');
+                name = name ? name + 1 : info->dlpi_name;
+                if (std::strncmp(name, "libsycl.so", 10) == 0) {
+                    ++libraries.count;
+                    const std::string prefix = "libsycl.so." + std::to_string(__LIBSYCL_MAJOR_VERSION);
+                    libraries.compatible &= std::strncmp(name, prefix.c_str(), prefix.size()) == 0
+                        && (name[prefix.size()] == '\0' || name[prefix.size()] == '.');
+                }
+                return 0;
+            },
+            &libraries
+        );
+        if (libraries.count != 1 || !libraries.compatible)
+            throw std::runtime_error("SYCL interoperability requires one shared, ABI-compatible libsycl runtime");
+    });
+}
+
 int wp_sycl_init()
 {
     return wp::sycl_checked([] {
@@ -414,6 +470,56 @@ void* wp_sycl_device_get(int ordinal)
         return nullptr;
     }
     return devices[ordinal].get();
+}
+
+void* wp_sycl_device_from_queue(void* handle)
+{
+    void* result = nullptr;
+    wp::sycl_checked([&] {
+        if (!handle)
+            throw std::invalid_argument("An external SYCL queue pointer must not be null");
+        const auto& queue = *static_cast<sycl::queue*>(handle);
+        for (const auto& device : devices) {
+            if (queue.get_device() == device->default_stream->queue.get_device()) {
+                external_queue(device.get(), handle);
+                result = device.get();
+                return;
+            }
+        }
+        throw std::runtime_error("No Warp SYCL device matches the external queue's physical device");
+    });
+    return result;
+}
+
+void* wp_sycl_device_from_pointer(const void* ptr)
+{
+    void* result = nullptr;
+    wp::sycl_checked([&] {
+        if (!ptr)
+            throw std::invalid_argument("An empty oneAPI DLPack capsule requires an explicit device");
+        for (const auto& device : devices) {
+            const auto& queue = device->default_stream->queue;
+            if (sycl::get_pointer_type(ptr, queue.get_context()) != sycl::usm::alloc::unknown
+                && sycl::get_pointer_device(ptr, queue.get_context()) == queue.get_device()) {
+                result = device.get();
+                return;
+            }
+        }
+        throw std::runtime_error("The oneAPI allocation is not accessible from a compatible Warp SYCL context");
+    });
+    return result;
+}
+
+int wp_sycl_pointer_check(void* device, const void* ptr)
+{
+    return wp::sycl_checked([&] {
+        if (!ptr)
+            return;
+        const auto& queue = get_device(device).default_stream->queue;
+        if (sycl::get_pointer_type(ptr, queue.get_context()) == sycl::usm::alloc::unknown
+            || sycl::get_pointer_device(ptr, queue.get_context()) != queue.get_device())
+            throw std::runtime_error("The allocation does not belong to this SYCL device and context");
+    });
 }
 
 const char* wp_sycl_device_name(void* device) { return get_device(device).name.c_str(); }
@@ -650,6 +756,43 @@ void* wp_sycl_stream_create(void* device)
     return result;
 }
 
+void* wp_sycl_stream_from_queue(void* device, void* queue)
+{
+    void* result = nullptr;
+    wp::sycl_checked([&] {
+        auto& state = get_device(device);
+        auto stream = std::make_unique<SyclStream>(external_queue(device, queue));
+        std::lock_guard<std::mutex> lock(state.streams_mutex);
+        state.streams.push_back(stream.get());
+        result = stream.release();
+    });
+    return result;
+}
+
+void* wp_sycl_stream_queue(void* stream) { return &static_cast<SyclStream*>(stream)->queue; }
+
+int wp_sycl_queue_matches_stream(void* device, void* handle, void* stream)
+{
+    int result = 0;
+    const int status = wp::sycl_checked([&] {
+        result = external_queue(device, handle) == static_cast<SyclStream*>(stream)->queue ? 1 : 0;
+    });
+    return status ? status : result;
+}
+
+int wp_sycl_queue_wait_stream(void* device, void* handle, void* stream)
+{
+    return wp::sycl_checked([&] {
+        auto& consumer = external_queue(device, handle);
+        auto& producer = static_cast<SyclStream*>(stream)->queue;
+        if (consumer == producer)
+            return;
+        if (get_device(device).capture)
+            throw std::runtime_error("Cross-queue DLPack export during SYCL capture requires a shared queue");
+        consumer.ext_oneapi_submit_barrier({ producer.ext_oneapi_submit_barrier() });
+    });
+}
+
 void* wp_sycl_stream_default(void* device) { return get_device(device).default_stream.get(); }
 
 void* wp_sycl_stream_current(void* device) { return get_device(device).current; }
@@ -744,6 +887,8 @@ int wp_sycl_event_record(void* device, void* event, void* stream, int external)
                     throw std::runtime_error("Cannot record a Level Zero queue timestamp");
             }
             record->event = queue.ext_oneapi_submit_barrier();
+        } else if (e->timing) {
+            record->event = experimental::submit_profiling_tag(queue);
         } else {
             record->event = queue.ext_oneapi_submit_barrier();
         }

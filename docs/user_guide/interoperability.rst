@@ -190,13 +190,21 @@ The canonical way to import an external array into Warp is using the :func:`warp
 
 The external array can be a PyTorch tensor, JAX array, or any other array type compatible with this version of the DLPack protocol. For CUDA arrays, this approach requires the producer to perform stream synchronization which ensures that operations on the array are ordered correctly. The :func:`warp.from_dlpack()` function asks the producer to synchronize the current Warp stream on the device where the array resides. It should therefore be safe to use the array in Warp kernels on that device without any additional synchronization.
 
-The canonical way to export a Warp array to an external framework is to use the ``from_dlpack()`` function in that framework::
+For CPU/CUDA arrays, the canonical way to export a Warp array to an external framework is to use the ``from_dlpack()`` function in that framework::
 
     jax_array = jax.dlpack.from_dlpack(warp_array)
     torch_tensor = torch.utils.dlpack.from_dlpack(warp_array)
     paddle_tensor = paddle.utils.dlpack.from_dlpack(warp_array)
 
 For CUDA arrays, this synchronizes the current stream of the consumer framework with the current Warp stream on the array's device. It should therefore be safe to use the wrapped array in the consumer framework, even if the array was previously used in a Warp kernel on the device.
+
+For SYCL arrays, exports require an explicit consuming ``sycl::queue*`` as a
+positive integer ``stream``. Use :func:`warp.to_torch` to select and retain the
+current Torch XPU queue automatically, or pass ``stream=queue`` to
+``warp_array.__dlpack__`` or :func:`warp.to_dlpack`. SYCL rejects ``None`` and
+``-1`` because producer synchronization alone cannot guarantee allocation
+lifetime on an unknown consumer queue. See :ref:`pytorch-interop` for runtime
+requirements, ordering, and zero-copy examples.
 
 Alternatively, arrays can be shared by explicitly creating PyCapsules using a ``to_dlpack()`` function provided by the producer framework. This approach may be used for older versions of frameworks that do not support the v2022.12 standard::
 
@@ -208,7 +216,10 @@ Alternatively, arrays can be shared by explicitly creating PyCapsules using a ``
     torch_tensor = torch.utils.dlpack.from_dlpack(wp.to_dlpack(warp_array))
     paddle_tensor = paddle.utils.dlpack.from_dlpack(wp.to_dlpack(warp_array))
 
-This approach is generally faster because it skips any stream synchronization, but another solution must be used to ensure correct ordering of operations. In situations where no synchronization is required, using this approach can yield better performance. This may be a good choice in situations like these:
+For CPU/CUDA arrays, this capsule approach skips protocol stream synchronization,
+so another solution must ensure correct ordering of operations. SYCL capsule
+exports still require ``stream=queue`` and retain/order that consumer.
+The CPU/CUDA approach may be appropriate in situations like these:
 
 - The external framework is using the synchronous CUDA default stream.
 - Warp and the external framework are using the same CUDA stream.
