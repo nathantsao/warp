@@ -301,7 +301,7 @@ def test_module_unload_during_graph_capture(test, device):
 
 devices = get_test_devices()
 cuda_devices = get_cuda_test_devices()
-devices_with_cuda_graph_module_load = get_test_devices_with_cuda_graph_module_load()
+devices_with_cuda_graph_module_load = get_test_devices_with_cuda_graph_module_load(backends=("cpu", "cuda", "sycl"))
 
 
 class TestReload(unittest.TestCase):

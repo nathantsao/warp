@@ -1417,7 +1417,7 @@ def test_cuda_graph_topo_alloc_free_serializes_dependent_streams_only(test, devi
 devices = get_test_devices()
 devices_with_cuda_graph_module_load = get_test_devices_with_cuda_graph_module_load()
 devices_with_graph_capture_allocation_and_cuda_graph_module_load = (
-    get_test_devices_with_graph_capture_allocation_and_cuda_graph_module_load()
+    get_test_devices_with_graph_capture_allocation_and_cuda_graph_module_load(backends=("cpu", "cuda", "sycl"))
 )
 cuda_devices_with_cuda_graph_module_load = [device for device in devices_with_cuda_graph_module_load if device.is_cuda]
 

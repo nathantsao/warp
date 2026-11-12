@@ -3059,40 +3059,56 @@ class TestTexture(unittest.TestCase):
 
 # Register tests - textures work on both CPU and CUDA devices
 cuda_devices = get_selected_cuda_test_devices()
-all_devices = get_test_devices()
+cpu_cuda_sycl_devices = get_test_devices(backends=("cpu", "cuda", "sycl"))
 
 # Core texture tests - run on all devices (CPU + CUDA)
-add_function_test(TestTexture, "test_texture1d_1channel", test_texture1d_1channel, devices=all_devices)
-add_function_test(TestTexture, "test_texture1d_2channel", test_texture1d_2channel, devices=all_devices)
-add_function_test(TestTexture, "test_texture1d_4channel", test_texture1d_4channel, devices=all_devices)
-add_function_test(TestTexture, "test_texture1d_linear_filter", test_texture1d_linear_filter, devices=all_devices)
-add_function_test(TestTexture, "test_texture1d_resolution_query", test_texture1d_resolution_query, devices=all_devices)
-add_function_test(TestTexture, "test_texture1d_new_del", test_texture1d_new_del, devices=all_devices)
-add_function_test(TestTexture, "test_texture2d_1channel", test_texture2d_1channel, devices=all_devices)
-add_function_test(TestTexture, "test_texture2d_2channel", test_texture2d_2channel, devices=all_devices)
-add_function_test(TestTexture, "test_texture2d_4channel", test_texture2d_4channel, devices=all_devices)
-add_function_test(TestTexture, "test_texture2d_linear_filter", test_texture2d_linear_filter, devices=all_devices)
-add_function_test(TestTexture, "test_texture2d_resolution_query", test_texture2d_resolution_query, devices=all_devices)
-add_function_test(TestTexture, "test_texture3d_1channel", test_texture3d_1channel, devices=all_devices)
-add_function_test(TestTexture, "test_texture3d_2channel", test_texture3d_2channel, devices=all_devices)
-add_function_test(TestTexture, "test_texture3d_4channel", test_texture3d_4channel, devices=all_devices)
-add_function_test(TestTexture, "test_texture3d_linear_filter", test_texture3d_linear_filter, devices=all_devices)
-add_function_test(TestTexture, "test_texture3d_resolution_query", test_texture3d_resolution_query, devices=all_devices)
+add_function_test(TestTexture, "test_texture1d_1channel", test_texture1d_1channel, devices=cpu_cuda_sycl_devices)
+add_function_test(TestTexture, "test_texture1d_2channel", test_texture1d_2channel, devices=cpu_cuda_sycl_devices)
+add_function_test(TestTexture, "test_texture1d_4channel", test_texture1d_4channel, devices=cpu_cuda_sycl_devices)
 add_function_test(
-    TestTexture, "test_texture_dtype_prefers_warp_types", test_texture_dtype_prefers_warp_types, devices=all_devices
+    TestTexture, "test_texture1d_linear_filter", test_texture1d_linear_filter, devices=cpu_cuda_sycl_devices
+)
+add_function_test(
+    TestTexture, "test_texture1d_resolution_query", test_texture1d_resolution_query, devices=cpu_cuda_sycl_devices
+)
+add_function_test(TestTexture, "test_texture1d_new_del", test_texture1d_new_del, devices=cpu_cuda_sycl_devices)
+add_function_test(TestTexture, "test_texture2d_1channel", test_texture2d_1channel, devices=cpu_cuda_sycl_devices)
+add_function_test(TestTexture, "test_texture2d_2channel", test_texture2d_2channel, devices=cpu_cuda_sycl_devices)
+add_function_test(TestTexture, "test_texture2d_4channel", test_texture2d_4channel, devices=cpu_cuda_sycl_devices)
+add_function_test(
+    TestTexture, "test_texture2d_linear_filter", test_texture2d_linear_filter, devices=cpu_cuda_sycl_devices
+)
+add_function_test(
+    TestTexture, "test_texture2d_resolution_query", test_texture2d_resolution_query, devices=cpu_cuda_sycl_devices
+)
+add_function_test(TestTexture, "test_texture3d_1channel", test_texture3d_1channel, devices=cpu_cuda_sycl_devices)
+add_function_test(TestTexture, "test_texture3d_2channel", test_texture3d_2channel, devices=cpu_cuda_sycl_devices)
+add_function_test(TestTexture, "test_texture3d_4channel", test_texture3d_4channel, devices=cpu_cuda_sycl_devices)
+add_function_test(
+    TestTexture, "test_texture3d_linear_filter", test_texture3d_linear_filter, devices=cpu_cuda_sycl_devices
+)
+add_function_test(
+    TestTexture, "test_texture3d_resolution_query", test_texture3d_resolution_query, devices=cpu_cuda_sycl_devices
+)
+add_function_test(
+    TestTexture,
+    "test_texture_dtype_prefers_warp_types",
+    test_texture_dtype_prefers_warp_types,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestTexture,
     "test_texture_dtype_float_alias_maps_to_float32",
     test_texture_dtype_float_alias_maps_to_float32,
-    devices=all_devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestTexture,
     "test_texture_dtype_int_alias_maps_to_int32",
     test_texture_dtype_int_alias_maps_to_int32,
-    devices=all_devices,
+    devices=cpu_cuda_sycl_devices,
 )
+# TODO: add sycl tests for remaining cuda only checks
 add_function_test(
     TestTexture,
     "test_texture2d_constructor_from_same_device_array",
@@ -3124,13 +3140,13 @@ add_function_test(
     TestTexture, "test_texture3d_cuda_interop_handles", test_texture3d_cuda_interop_handles, devices=cuda_devices
 )
 add_function_test(
-    TestTexture, "test_texture_id_device_independent", test_texture_id_device_independent, devices=all_devices
+    TestTexture, "test_texture_id_device_independent", test_texture_id_device_independent, devices=cpu_cuda_sycl_devices
 )
 add_function_test(
     TestTexture,
     "test_texture_handle_properties_host_vs_cuda",
     test_texture_handle_properties_host_vs_cuda,
-    devices=all_devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestTexture, "test_texture2d_cuda_array_copy_api", test_texture2d_cuda_array_copy_api, devices=cuda_devices
@@ -3139,7 +3155,10 @@ add_function_test(
     TestTexture, "test_texture3d_cuda_array_copy_api", test_texture3d_cuda_array_copy_api, devices=cuda_devices
 )
 add_function_test(
-    TestTexture, "test_texture_copy_validation_messages", test_texture_copy_validation_messages, devices=all_devices
+    TestTexture,
+    "test_texture_copy_validation_messages",
+    test_texture_copy_validation_messages,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestTexture,
@@ -3210,46 +3229,58 @@ add_function_test(
 
 # Interpolation tests - run on all devices
 add_function_test(
-    TestTexture, "test_texture2d_nearest_interpolation", test_texture2d_nearest_interpolation, devices=all_devices
+    TestTexture,
+    "test_texture2d_nearest_interpolation",
+    test_texture2d_nearest_interpolation,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
-    TestTexture, "test_texture2d_linear_interpolation", test_texture2d_linear_interpolation, devices=all_devices
+    TestTexture,
+    "test_texture2d_linear_interpolation",
+    test_texture2d_linear_interpolation,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
-    TestTexture, "test_texture3d_nearest_interpolation", test_texture3d_nearest_interpolation, devices=all_devices
+    TestTexture,
+    "test_texture3d_nearest_interpolation",
+    test_texture3d_nearest_interpolation,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
-    TestTexture, "test_texture3d_linear_interpolation", test_texture3d_linear_interpolation, devices=all_devices
+    TestTexture,
+    "test_texture3d_linear_interpolation",
+    test_texture3d_linear_interpolation,
+    devices=cpu_cuda_sycl_devices,
 )
 
 # Compressed texture tests (uint8, uint16) - run on all devices
-add_function_test(TestTexture, "test_texture2d_uint8", test_texture2d_uint8, devices=all_devices)
-add_function_test(TestTexture, "test_texture2d_uint16", test_texture2d_uint16, devices=all_devices)
-add_function_test(TestTexture, "test_texture3d_uint8", test_texture3d_uint8, devices=all_devices)
-add_function_test(TestTexture, "test_texture3d_uint16", test_texture3d_uint16, devices=all_devices)
+add_function_test(TestTexture, "test_texture2d_uint8", test_texture2d_uint8, devices=cpu_cuda_sycl_devices)
+add_function_test(TestTexture, "test_texture2d_uint16", test_texture2d_uint16, devices=cpu_cuda_sycl_devices)
+add_function_test(TestTexture, "test_texture3d_uint8", test_texture3d_uint8, devices=cpu_cuda_sycl_devices)
+add_function_test(TestTexture, "test_texture3d_uint16", test_texture3d_uint16, devices=cpu_cuda_sycl_devices)
 add_function_test(
     TestTexture,
     "test_texture2d_uint8_linear_interpolation",
     test_texture2d_uint8_linear_interpolation,
-    devices=all_devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestTexture,
     "test_texture2d_uint16_linear_interpolation",
     test_texture2d_uint16_linear_interpolation,
-    devices=all_devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestTexture,
     "test_texture3d_uint8_linear_interpolation",
     test_texture3d_uint8_linear_interpolation,
-    devices=all_devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestTexture,
     "test_texture3d_uint16_linear_interpolation",
     test_texture3d_uint16_linear_interpolation,
-    devices=all_devices,
+    devices=cpu_cuda_sycl_devices,
 )
 
 # These tests don't need a device
@@ -3258,37 +3289,54 @@ add_function_test(TestTexture, "test_texture3d_new_del", test_texture3d_new_del,
 
 # Per-axis address mode tests - run on all devices
 add_function_test(
-    TestTexture, "test_texture2d_per_axis_address_modes", test_texture2d_per_axis_address_modes, devices=all_devices
+    TestTexture,
+    "test_texture2d_per_axis_address_modes",
+    test_texture2d_per_axis_address_modes,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
-    TestTexture, "test_texture2d_address_mode_tuple", test_texture2d_address_mode_tuple, devices=all_devices
+    TestTexture, "test_texture2d_address_mode_tuple", test_texture2d_address_mode_tuple, devices=cpu_cuda_sycl_devices
 )
 add_function_test(
-    TestTexture, "test_texture3d_per_axis_address_modes", test_texture3d_per_axis_address_modes, devices=all_devices
+    TestTexture,
+    "test_texture3d_per_axis_address_modes",
+    test_texture3d_per_axis_address_modes,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
-    TestTexture, "test_texture3d_address_mode_tuple", test_texture3d_address_mode_tuple, devices=all_devices
+    TestTexture, "test_texture3d_address_mode_tuple", test_texture3d_address_mode_tuple, devices=cpu_cuda_sycl_devices
 )
-add_function_test(TestTexture, "test_texture2d_wrap_linear_edge", test_texture2d_wrap_linear_edge, devices=all_devices)
 add_function_test(
-    TestTexture, "test_texture2d_mirror_linear_edge", test_texture2d_mirror_linear_edge, devices=all_devices
+    TestTexture, "test_texture2d_wrap_linear_edge", test_texture2d_wrap_linear_edge, devices=cpu_cuda_sycl_devices
+)
+add_function_test(
+    TestTexture, "test_texture2d_mirror_linear_edge", test_texture2d_mirror_linear_edge, devices=cpu_cuda_sycl_devices
 )
 
 # Non-normalized coordinates tests - run on all devices
 add_function_test(
-    TestTexture, "test_texture2d_non_normalized_coords", test_texture2d_non_normalized_coords, devices=all_devices
+    TestTexture,
+    "test_texture2d_non_normalized_coords",
+    test_texture2d_non_normalized_coords,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestTexture,
     "test_texture2d_non_normalized_at_all_texels",
     test_texture2d_non_normalized_at_all_texels,
-    devices=all_devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
-    TestTexture, "test_texture3d_non_normalized_coords", test_texture3d_non_normalized_coords, devices=all_devices
+    TestTexture,
+    "test_texture3d_non_normalized_coords",
+    test_texture3d_non_normalized_coords,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
-    TestTexture, "test_texture2d_non_normalized_linear", test_texture2d_non_normalized_linear, devices=all_devices
+    TestTexture,
+    "test_texture2d_non_normalized_linear",
+    test_texture2d_non_normalized_linear,
+    devices=cpu_cuda_sycl_devices,
 )
 
 # Backward compatibility tests - run on all devices
@@ -3296,24 +3344,28 @@ add_function_test(
     TestTexture,
     "test_texture2d_backward_compat_address_mode",
     test_texture2d_backward_compat_address_mode,
-    devices=all_devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestTexture,
     "test_texture3d_backward_compat_address_mode",
     test_texture3d_backward_compat_address_mode,
-    devices=all_devices,
+    devices=cpu_cuda_sycl_devices,
 )
 
 # Texture array tests - run on all devices
-add_function_test(TestTexture, "test_texture2d_array", test_texture2d_array, devices=all_devices)
-add_function_test(TestTexture, "test_texture3d_array", test_texture3d_array, devices=all_devices)
+add_function_test(TestTexture, "test_texture2d_array", test_texture2d_array, devices=cpu_cuda_sycl_devices)
+add_function_test(TestTexture, "test_texture3d_array", test_texture3d_array, devices=cpu_cuda_sycl_devices)
 
 # Texture as struct member tests - run on all devices
-add_function_test(TestTexture, "test_texture2d_struct_member", test_texture2d_struct_member, devices=all_devices)
-add_function_test(TestTexture, "test_texture3d_struct_member", test_texture3d_struct_member, devices=all_devices)
 add_function_test(
-    TestTexture, "test_texture_struct_both_members", test_texture_struct_both_members, devices=all_devices
+    TestTexture, "test_texture2d_struct_member", test_texture2d_struct_member, devices=cpu_cuda_sycl_devices
+)
+add_function_test(
+    TestTexture, "test_texture3d_struct_member", test_texture3d_struct_member, devices=cpu_cuda_sycl_devices
+)
+add_function_test(
+    TestTexture, "test_texture_struct_both_members", test_texture_struct_both_members, devices=cpu_cuda_sycl_devices
 )
 
 # Mipmap tests - run on all devices
@@ -3321,37 +3373,37 @@ add_function_test(
     TestTexture,
     "test_texture2d_mipmap_full_chain",
     test_texture2d_mipmap_full_chain,
-    devices=all_devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestTexture,
     "test_texture2d_mipmap_lod_selects_constant_level",
     test_texture2d_mipmap_lod_selects_constant_level,
-    devices=all_devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestTexture,
     "test_texture1d_mipmap",
     test_texture1d_mipmap,
-    devices=all_devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestTexture,
     "test_texture3d_mipmap",
     test_texture3d_mipmap,
-    devices=all_devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestTexture,
     "test_texture2d_mipmap_rejects_copy",
     test_texture2d_mipmap_rejects_copy,
-    devices=all_devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestTexture,
     "test_texture_mipmap_invalid_levels",
     test_texture_mipmap_invalid_levels,
-    devices=all_devices,
+    devices=cpu_cuda_sycl_devices,
 )
 
 # 32-bit integer texture tests - run on all devices, since the point is that CPU and CUDA agree
@@ -3359,25 +3411,25 @@ add_function_test(
     TestTexture,
     "test_texture_sample_rejects_32bit_int",
     test_texture_sample_rejects_32bit_int,
-    devices=all_devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestTexture,
     "test_texture_32bit_int_non_sampling_kernel",
     test_texture_32bit_int_non_sampling_kernel,
-    devices=all_devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestTexture,
     "test_texture_sample_allows_small_int_dtypes",
     test_texture_sample_allows_small_int_dtypes,
-    devices=all_devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestTexture,
     "test_texture_uint32_storage_round_trip",
     test_texture_uint32_storage_round_trip,
-    devices=all_devices,
+    devices=cpu_cuda_sycl_devices,
 )
 
 

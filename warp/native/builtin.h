@@ -2068,7 +2068,7 @@ CUDA_CALLABLE inline void slice_assert_step_nonzero(const slice_t& slice)
     printf("slice step cannot be zero\n");
     __trap();
 #elif defined(__SYCL_DEVICE_ONLY__)
-    printf("slice step cannot be zero\n");
+    __assert_fail("slice step cannot be zero", __FILE__, unsigned(__LINE__), __func__);
 #else
     _wp_assert("slice step cannot be zero", __FILE__, unsigned(__LINE__));
 #endif

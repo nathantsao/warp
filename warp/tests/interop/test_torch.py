@@ -97,7 +97,7 @@ def _import_torch():
 
 
 def _active_torch_stream(tensor):
-    if tensor.is_cuda:
+    if tensor.device.type in ("cuda", "xpu"):
         return wp.ScopedStream(wp.stream_from_torch(tensor.device))
 
     return wp.ScopedStream(None)
@@ -704,17 +704,18 @@ def test_from_torch_zero_strides(test, device):
 
 def test_torch_mgpu_from_torch(test, device):
     torch = _import_torch()
+    backend = "xpu" if device.is_sycl else "cuda"
 
     n = 32
 
-    t0 = torch.arange(0, n, 1, dtype=torch.int32, device="cuda:0")
-    t1 = torch.arange(0, n * 2, 2, dtype=torch.int32, device="cuda:1")
+    t0 = torch.arange(0, n, 1, dtype=torch.int32, device=f"{backend}:0")
+    t1 = torch.arange(0, n * 2, 2, dtype=torch.int32, device=f"{backend}:1")
 
     a0 = wp.from_torch(t0, dtype=wp.int32)
     a1 = wp.from_torch(t1, dtype=wp.int32)
 
-    assert a0.device == "cuda:0"
-    assert a1.device == "cuda:1"
+    assert a0.device == wp.device_from_torch(f"{backend}:0")
+    assert a1.device == wp.device_from_torch(f"{backend}:1")
 
     expected0 = np.arange(0, n, 1)
     expected1 = np.arange(0, n * 2, 2)
@@ -724,21 +725,22 @@ def test_torch_mgpu_from_torch(test, device):
 
 
 def test_torch_mgpu_to_torch(test, device):
+    backend = "xpu" if device.is_sycl else "cuda"
     n = 32
 
-    with wp.ScopedDevice("cuda:0"):
+    with wp.ScopedDevice(wp.device_from_torch(f"{backend}:0")):
         a0 = wp.empty(n, dtype=wp.int32)
         wp.launch(arange, dim=a0.size, inputs=[0, 1, a0])
 
-    with wp.ScopedDevice("cuda:1"):
+    with wp.ScopedDevice(wp.device_from_torch(f"{backend}:1")):
         a1 = wp.empty(n, dtype=wp.int32)
         wp.launch(arange, dim=a1.size, inputs=[0, 2, a1])
 
     t0 = wp.to_torch(a0)
     t1 = wp.to_torch(a1)
 
-    assert str(t0.device) == "cuda:0"
-    assert str(t1.device) == "cuda:1"
+    assert str(t0.device) == f"{backend}:0"
+    assert str(t1.device) == f"{backend}:1"
 
     expected0 = np.arange(0, n, 1, dtype=np.int32)
     expected1 = np.arange(0, n * 2, 2, dtype=np.int32)
@@ -749,21 +751,23 @@ def test_torch_mgpu_to_torch(test, device):
 
 def test_torch_mgpu_interop(test, device):
     torch = _import_torch()
+    backend = "xpu" if device.is_sycl else "cuda"
+    torch_backend = getattr(torch, backend)
 
     n = 1024 * 1024
 
-    with torch.cuda.device(0):
-        t0 = torch.arange(n, dtype=torch.float32, device="cuda")
+    with torch_backend.device(0):
+        t0 = torch.arange(n, dtype=torch.float32, device=backend)
         a0 = wp.from_torch(t0)
-        wp.launch(inc, dim=a0.size, inputs=[a0], stream=wp.stream_from_torch())
+        wp.launch(inc, dim=a0.size, inputs=[a0], stream=wp.stream_from_torch(torch_backend.current_stream()))
 
-    with torch.cuda.device(1):
-        t1 = torch.arange(n, dtype=torch.float32, device="cuda")
+    with torch_backend.device(1):
+        t1 = torch.arange(n, dtype=torch.float32, device=backend)
         a1 = wp.from_torch(t1)
-        wp.launch(inc, dim=a1.size, inputs=[a1], stream=wp.stream_from_torch())
+        wp.launch(inc, dim=a1.size, inputs=[a1], stream=wp.stream_from_torch(torch_backend.current_stream()))
 
-    assert a0.device == "cuda:0"
-    assert a1.device == "cuda:1"
+    assert a0.device == wp.device_from_torch(f"{backend}:0")
+    assert a1.device == wp.device_from_torch(f"{backend}:1")
 
     expected = np.arange(n, dtype=int) + 1
 
@@ -997,17 +1001,18 @@ def test_torch_tape_autograd_mutation_between_retained_backward(test, device):
 
 
 def test_torch_tape_autograd_torch_stream(test, device):
-    """Test Tape-backed PyTorch autograd on a non-default PyTorch CUDA stream."""
+    """Test Tape-backed PyTorch autograd on a non-default PyTorch accelerator stream."""
 
     torch = _import_torch()
+    torch_backend = torch.xpu if device.is_sycl else torch.cuda
     torch_device = wp.device_to_torch(device)
     Fn = _make_tape_square_function(wp.float64)
 
     expected_x = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64, device=torch_device)
-    torch_stream = torch.cuda.Stream(device=torch_device)
+    torch_stream = torch_backend.Stream(device=torch_device)
 
     with wp.ScopedDevice(device):
-        with torch.cuda.stream(torch_stream):
+        with torch_backend.stream(torch_stream):
             x = expected_x.clone().requires_grad_(True)
             y = Fn.apply(x)
             (grad,) = torch.autograd.grad(y, (x,), grad_outputs=torch.ones_like(y), retain_graph=False)
@@ -1024,6 +1029,7 @@ def test_torch_graph_torch_stream(test, device):
     wp.load_module(device=device)
 
     torch = _import_torch()
+    torch_backend = torch.xpu if device.is_sycl else torch.cuda
 
     torch_device = wp.device_to_torch(device)
 
@@ -1031,17 +1037,17 @@ def test_torch_graph_torch_stream(test, device):
     t = torch.zeros(n, dtype=torch.float32, device=torch_device)
     a = wp.from_torch(t)
 
-    g = torch.cuda.CUDAGraph()
+    g = torch_backend.XPUGraph() if device.is_sycl else torch_backend.CUDAGraph()
 
     # create a device-specific torch stream to use for capture
     # (otherwise torch.cuda.graph reuses its capture stream, which can be problematic if it's from a different device)
-    torch_stream = torch.cuda.Stream(device=torch_device)
+    torch_stream = torch_backend.Stream(device=torch_device)
 
     # make warp use the same stream
     warp_stream = wp.stream_from_torch(torch_stream)
 
     # capture graph
-    with wp.ScopedStream(warp_stream), torch.cuda.graph(g, stream=torch_stream):
+    with wp.ScopedStream(warp_stream), torch_backend.graph(g, stream=torch_stream):
         wp.capture_begin(force_module_load=False, external=True)
         try:
             t += 1.0
@@ -1069,6 +1075,7 @@ def _test_torch_graph_radix_sort(test, device, register_capture):
     about the intentionally leaked scratch buffer).
     """
     torch = _import_torch()
+    torch_backend = torch.xpu if device.is_sycl else torch.cuda
 
     torch_device = wp.device_to_torch(device)
 
@@ -1099,17 +1106,17 @@ def _test_torch_graph_radix_sort(test, device, register_capture):
         np.testing.assert_array_equal(kl.numpy()[:n_large], kl_np[lo])
         np.testing.assert_array_equal(vl.numpy()[:n_large], vl_np[lo])
 
-    g = torch.cuda.CUDAGraph()
+    g = torch_backend.XPUGraph() if device.is_sycl else torch_backend.CUDAGraph()
 
     # create a device-specific torch stream to use for capture
     # (otherwise torch.cuda.graph reuses its capture stream, which can be problematic if it's from a different device)
-    torch_stream = torch.cuda.Stream(device=torch_device)
+    torch_stream = torch_backend.Stream(device=torch_device)
 
     # make warp use the same stream
     warp_stream = wp.stream_from_torch(torch_stream)
 
     # capture graph, with the sorts requiring scratch reallocation mid-capture
-    with wp.ScopedStream(warp_stream), torch.cuda.graph(g, stream=torch_stream):
+    with wp.ScopedStream(warp_stream), torch_backend.graph(g, stream=torch_stream):
         if register_capture:
             wp.capture_begin(force_module_load=False, external=True)
         try:
@@ -1144,6 +1151,7 @@ def test_torch_graph_warp_stream(test, device):
     """Capture a Torch graph on a Warp stream."""
 
     torch = _import_torch()
+    torch_backend = torch.xpu if device.is_sycl else torch.cuda
 
     torch_device = wp.device_to_torch(device)
 
@@ -1151,19 +1159,19 @@ def test_torch_graph_warp_stream(test, device):
     t = torch.zeros(n, dtype=torch.float32, device=torch_device)
     a = wp.from_torch(t)
 
-    g = torch.cuda.CUDAGraph()
+    g = torch_backend.XPUGraph() if device.is_sycl else torch_backend.CUDAGraph()
 
     # PyTorch 2.12 rejects CUDA graph capture on blocking streams because its
     # capture bookkeeping touches the legacy stream. Warp's own streams are
     # currently created with CU_STREAM_DEFAULT (blocking), so we route capture
     # through a PyTorch-created non-blocking stream wrapped as a Warp stream.
     # Revisit if Warp gains an API for creating non-blocking streams.
-    base_torch_stream = torch.cuda.Stream(device=torch_device)
+    base_torch_stream = torch_backend.Stream(device=torch_device)
     warp_stream = wp.stream_from_torch(base_torch_stream)
     torch_stream = wp.stream_to_torch(warp_stream)
 
     # capture graph
-    with wp.ScopedStream(warp_stream), torch.cuda.graph(g, stream=torch_stream):
+    with wp.ScopedStream(warp_stream), torch_backend.graph(g, stream=torch_stream):
         wp.capture_begin(force_module_load=False, external=True)
         try:
             t += 1.0
@@ -1186,6 +1194,7 @@ def test_warp_graph_warp_stream(test, device):
     """Capture a Warp graph on a Warp stream."""
 
     torch = _import_torch()
+    torch_backend = torch.xpu if device.is_sycl else torch.cuda
 
     torch_device = wp.device_to_torch(device)
 
@@ -1197,7 +1206,7 @@ def test_warp_graph_warp_stream(test, device):
     torch_stream = wp.stream_to_torch(device)
 
     # capture graph
-    with wp.ScopedDevice(device), torch.cuda.stream(torch_stream):
+    with wp.ScopedDevice(device), torch_backend.stream(torch_stream):
         wp.capture_begin(force_module_load=False)
         try:
             t += 1.0
@@ -1222,6 +1231,7 @@ def test_warp_graph_torch_stream(test, device):
     wp.load_module(device=device)
 
     torch = _import_torch()
+    torch_backend = torch.xpu if device.is_sycl else torch.cuda
 
     torch_device = wp.device_to_torch(device)
 
@@ -1231,13 +1241,13 @@ def test_warp_graph_torch_stream(test, device):
 
     # create a device-specific torch stream to use for capture
     # (the default torch stream is not suitable for graph capture)
-    torch_stream = torch.cuda.Stream(device=torch_device)
+    torch_stream = torch_backend.Stream(device=torch_device)
 
     # make warp use the same stream
     warp_stream = wp.stream_from_torch(torch_stream)
 
     # capture graph
-    with wp.ScopedStream(warp_stream), torch.cuda.stream(torch_stream):
+    with wp.ScopedStream(warp_stream), torch_backend.stream(torch_stream):
         wp.capture_begin(force_module_load=False)
         try:
             t += 1.0
@@ -1371,7 +1381,11 @@ def test_bf16_torch_compound_types(test, device):
 
 
 class TestTorch(unittest.TestCase):
-    pass
+    """Share conversion tests across CPU, CUDA, and SYCL.
+
+    Direct XPU tensor kernel arguments lack CUDA parity. Remove their registration
+    skips once kernel argument packing accepts XPU tensors without wp.from_torch().
+    """
 
 
 try:
@@ -1379,8 +1393,9 @@ try:
 except Exception as error:
     print(f"Skipping Torch tests due to exception: {error}")
 else:
-    torch_candidate_devices = get_test_devices()
-    torch_cuda_candidate_devices = [device for device in torch_candidate_devices if device.is_cuda]
+    torch_candidate_devices = get_test_devices(backends=("cpu", "cuda", "sycl"))
+    torch_cuda_candidate_devices = get_cuda_test_devices()
+    torch_accelerator_candidate_devices = get_test_devices(backends=("cuda", "sycl"))
     torch_apic_candidate_devices = get_test_devices_with_cuda_graph_module_load()
 
     @cache
@@ -1399,9 +1414,23 @@ else:
         if error is not None:
             test.skipTest(f"Torch is unavailable on Warp device '{device}': {error}")
 
-    def _check_required_torch_cuda_devices(test, _device):
-        for device in ("cuda:0", "cuda:1"):
-            _check_torch_device(test, device)
+    def _check_torch_kernel_argument(test, device):
+        _check_torch_device(test, device)
+        if device.is_sycl:
+            test.skipTest("Missing CUDA parity: direct XPU tensor kernel arguments require wp.from_torch().")
+
+    def _check_torch_bf16_device(test, device):
+        _check_torch_device(test, device)
+        if device.is_sycl:
+            with torch.xpu.device(wp.device_to_torch(device)):
+                if not torch.xpu.is_bf16_supported():
+                    test.skipTest("Torch XPU device does not support bfloat16")
+
+    def _check_required_torch_devices(test, device):
+        _check_torch_device(test, device)
+        backend = "xpu" if device.is_sycl else "cuda"
+        for index in (0, 1):
+            _check_torch_device(test, wp.device_from_torch(f"{backend}:{index}"))
 
     add_function_test(TestTorch, "test_dtype_from_torch", test_dtype_from_torch, devices=None)
     add_function_test(TestTorch, "test_dtype_to_torch", test_dtype_to_torch, devices=None)
@@ -1517,66 +1546,68 @@ else:
             "test_direct",
             test_direct,
             devices=torch_candidate_devices,
-            device_check=_check_torch_device,
+            device_check=_check_torch_kernel_argument,
         )
         add_function_test(
             TestTorch,
             "test_tensor_in_warp_kernel",
             test_tensor_in_warp_kernel,
             devices=torch_candidate_devices,
-            device_check=_check_torch_device,
+            device_check=_check_torch_kernel_argument,
         )
-
-    if torch_cuda_candidate_devices:
+    # TODO: currently fails on SYCL
+    if torch_accelerator_candidate_devices:
         add_function_test(
             TestTorch,
             "test_torch_graph_torch_stream",
             test_torch_graph_torch_stream,
-            devices=torch_cuda_candidate_devices,
+            devices=torch_accelerator_candidate_devices,
             device_check=_check_torch_device,
         )
         add_function_test(
             TestTorch,
             "test_torch_tape_autograd_torch_stream",
             test_torch_tape_autograd_torch_stream,
-            devices=torch_cuda_candidate_devices,
+            devices=torch_accelerator_candidate_devices,
             device_check=_check_torch_device,
         )
         add_function_test(
             TestTorch,
             "test_torch_graph_radix_sort_registered",
             test_torch_graph_radix_sort_registered,
-            devices=torch_cuda_candidate_devices,
+            devices=torch_accelerator_candidate_devices,
             device_check=_check_torch_device,
         )
         add_function_test(
             TestTorch,
             "test_torch_graph_radix_sort_unregistered",
             test_torch_graph_radix_sort_unregistered,
-            devices=torch_cuda_candidate_devices,
+            devices=torch_accelerator_candidate_devices,
             device_check=_check_torch_device,
         )
         add_function_test(
             TestTorch,
             "test_torch_graph_warp_stream",
             test_torch_graph_warp_stream,
-            devices=torch_cuda_candidate_devices,
+            devices=torch_accelerator_candidate_devices,
             device_check=_check_torch_device,
         )
         add_function_test(
             TestTorch,
             "test_warp_graph_warp_stream",
             test_warp_graph_warp_stream,
-            devices=torch_cuda_candidate_devices,
+            devices=torch_accelerator_candidate_devices,
             device_check=_check_torch_device,
         )
         add_function_test(
             TestTorch,
             "test_warp_graph_torch_stream",
             test_warp_graph_torch_stream,
-            devices=torch_cuda_candidate_devices,
+            devices=torch_accelerator_candidate_devices,
             device_check=_check_torch_device,
         )
+
+    if torch_cuda_candidate_devices:
         add_function_test(
             TestTorch,
             "test_cuda_array_interface",
@@ -1595,31 +1626,41 @@ else:
         )
 
     # multi-GPU tests
-    if len(torch_cuda_candidate_devices) > 1:
+    torch_mgpu_devices = []
+    for backend in ("cuda", "sycl"):
+        backend_devices = get_test_devices(mode="all", backends=(backend,))
+        if len(backend_devices) > 1:
+            torch_mgpu_devices.append(backend_devices[0])
+    if torch_mgpu_devices:
         add_function_test(
             TestTorch,
             "test_torch_mgpu_from_torch",
             test_torch_mgpu_from_torch,
-            device_check=_check_required_torch_cuda_devices,
+            devices=torch_mgpu_devices,
+            device_check=_check_required_torch_devices,
         )
         add_function_test(
             TestTorch,
             "test_torch_mgpu_to_torch",
             test_torch_mgpu_to_torch,
-            device_check=_check_required_torch_cuda_devices,
+            devices=torch_mgpu_devices,
+            device_check=_check_required_torch_devices,
         )
         add_function_test(
             TestTorch,
             "test_torch_mgpu_interop",
             test_torch_mgpu_interop,
-            device_check=_check_required_torch_cuda_devices,
+            devices=torch_mgpu_devices,
+            device_check=_check_required_torch_devices,
         )
 
     add_function_test(TestTorch, "test_torch_to_warp_types", test_torch_to_warp_types)
 
-    # bfloat16 tests require arch >= 80
+    # CUDA bfloat16 tests require arch >= 80.
     bf16_torch_devices = [
-        device for device in torch_candidate_devices if device.is_cpu or (device.is_cuda and device.arch >= 80)
+        device
+        for device in torch_candidate_devices
+        if device.is_cpu or device.is_sycl or (device.is_cuda and device.arch >= 80)
     ]
     if bf16_torch_devices:
         add_function_test(
@@ -1627,14 +1668,14 @@ else:
             "test_bf16_interop_torch",
             test_bf16_interop_torch,
             devices=bf16_torch_devices,
-            device_check=_check_torch_device,
+            device_check=_check_torch_bf16_device,
         )
         add_function_test(
             TestTorch,
             "test_bf16_torch_compound_types",
             test_bf16_torch_compound_types,
             devices=bf16_torch_devices,
-            device_check=_check_torch_device,
+            device_check=_check_torch_bf16_device,
         )
 
 if __name__ == "__main__":

@@ -436,7 +436,7 @@ def test_mesh_exceptions(test, device):
         wp.Mesh(points=points, indices=indices, bvh_constructor="cuqbl")
 
 
-devices = get_test_devices()
+cpu_cuda_sycl_devices = get_test_devices(backends=("cpu", "cuda", "sycl"))
 cuda_devices_with_mempool = get_selected_cuda_test_devices_with_mempool()
 
 
@@ -485,11 +485,12 @@ class TestMesh(unittest.TestCase):
             mesh.points = points_new
 
 
-add_function_test(TestMesh, "test_mesh_read_properties", test_mesh_read_properties, devices=devices)
-add_function_test(TestMesh, "test_mesh_query_point", test_mesh_query_point, devices=devices)
-add_function_test(TestMesh, "test_mesh_query_ray", test_mesh_query_ray, devices=devices)
-add_function_test(TestMesh, "test_grouped_mesh_query_ray", test_grouped_mesh_query_ray, devices=devices)
-add_function_test(TestMesh, "test_mesh_refit", test_mesh_refit, devices=devices)
+add_function_test(TestMesh, "test_mesh_read_properties", test_mesh_read_properties, devices=cpu_cuda_sycl_devices)
+add_function_test(TestMesh, "test_mesh_query_point", test_mesh_query_point, devices=cpu_cuda_sycl_devices)
+add_function_test(TestMesh, "test_mesh_query_ray", test_mesh_query_ray, devices=cpu_cuda_sycl_devices)
+add_function_test(TestMesh, "test_grouped_mesh_query_ray", test_grouped_mesh_query_ray, devices=cpu_cuda_sycl_devices)
+add_function_test(TestMesh, "test_mesh_refit", test_mesh_refit, devices=cpu_cuda_sycl_devices)
+# TODO: add sycl support
 add_function_test(TestMesh, "test_mesh_refit_graph", test_mesh_refit_graph, devices=cuda_devices_with_mempool)
 add_function_test(TestMesh, "test_mesh_exceptions", test_mesh_exceptions, devices=get_selected_cuda_test_devices())
 

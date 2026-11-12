@@ -972,7 +972,7 @@ def test_set_mesh_points(test, device):
             test.assertTrue(((query_results_min_dist1.numpy() - query_results_min_dist2.numpy()) < 1e-5).all())
 
 
-devices = get_test_devices()
+cpu_cuda_sycl_devices = get_test_devices(backends=("cpu", "cuda", "sycl"))
 
 
 class TestMeshQueryPoint(unittest.TestCase):
@@ -999,10 +999,14 @@ class TestMeshQueryPoint(unittest.TestCase):
         wp.Kernel(func=kernel_fn)
 
 
-add_function_test(TestMeshQueryPoint, "test_mesh_query_point", test_mesh_query_point, devices=devices)
-add_function_test(TestMeshQueryPoint, "test_mesh_query_furthest_point", test_mesh_query_furthest_point, devices=devices)
-add_function_test(TestMeshQueryPoint, "test_adj_mesh_query_point", test_adj_mesh_query_point, devices=devices)
-add_function_test(TestMeshQueryPoint, "test_set_mesh_points", test_set_mesh_points, devices=devices)
+add_function_test(TestMeshQueryPoint, "test_mesh_query_point", test_mesh_query_point, devices=cpu_cuda_sycl_devices)
+add_function_test(
+    TestMeshQueryPoint, "test_mesh_query_furthest_point", test_mesh_query_furthest_point, devices=cpu_cuda_sycl_devices
+)
+add_function_test(
+    TestMeshQueryPoint, "test_adj_mesh_query_point", test_adj_mesh_query_point, devices=cpu_cuda_sycl_devices
+)
+add_function_test(TestMeshQueryPoint, "test_set_mesh_points", test_set_mesh_points, devices=cpu_cuda_sycl_devices)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

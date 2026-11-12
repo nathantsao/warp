@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import ctypes
-from functools import cache
+from functools import cache, lru_cache
 from typing import TYPE_CHECKING
 
 import numpy
@@ -529,6 +529,51 @@ def stream_from_torch(stream_or_device=None):
     warp_stream._torch_stream = stream
 
     return warp_stream
+
+# TODO: double check if this is really needed for sycl
+@lru_cache(maxsize=32)
+def _cached_stream_from_torch(stream):
+    return stream_from_torch(stream)
+
+# TODO: double check if this is really necessary for sycl
+def set_torch_stream_enabled(torch_device: torch.device | str, enabled: bool = True) -> None:
+    """Use Torch's current XPU queue for a device's default Warp operations.
+
+    CPU and CUDA behavior is unchanged. For XPU, queue transitions establish
+    device-side dependencies on preceding Warp work. Explicit Warp streams take
+    precedence. Torch accesses on another queue still require an explicit Torch
+    dependency before reading shared storage. Queue changes during graph capture
+    are not supported. Call this function outside explicit Warp stream scopes.
+
+    Args:
+        torch_device: Torch device identifier.
+        enabled: Whether to share Torch's current queue. Disabling restores the
+            previous Warp stream after waiting for the shared queue.
+    """
+    import torch  # noqa: PLC0415
+
+    device = device_from_torch(torch_device)
+    if not device.is_sycl:
+        return
+    if device.captures:
+        raise RuntimeError("Cannot configure the shared Torch queue during graph capture")
+    if enabled:
+        if device._stream_provider is not None:
+            return
+        torch_device = torch.device(device_to_torch(device))
+        stream = _cached_stream_from_torch(torch.xpu.current_stream(torch_device))
+        device._stream_provider_saved = device.stream
+        device.set_stream(stream, sync=True)
+        device._stream_provider_stream = stream
+        device._stream_provider = lambda: _cached_stream_from_torch(torch.xpu.current_stream(torch_device))
+    elif device._stream_provider is not None:
+        if device._stream is not device._stream_provider_stream:
+            raise RuntimeError("Cannot disable the shared Torch queue inside an explicit Warp stream scope")
+        _ = device.stream
+        device._stream_provider = None
+        device.set_stream(device._stream_provider_saved, sync=True)
+        device._stream_provider_stream = None
+        device._stream_provider_saved = None
 
 
 def stream_to_torch(stream_or_device=None):

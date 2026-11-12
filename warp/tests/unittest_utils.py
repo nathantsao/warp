@@ -115,33 +115,9 @@ def get_selected_cuda_test_devices(mode: str | None = None):
           ``"unique_or_2x"`` behaves like ``"unique"`` but adds up to one
           additional CUDA device if the system only devices of a single CUDA
           architecture.
+          ``"all"`` returns every CUDA device.
     """
-
-    if mode is None:
-        mode = test_mode
-
-    if mode == "basic":
-        if wp.is_cuda_available():
-            return [wp.get_device("cuda:0")]
-        else:
-            return []
-
-    cuda_devices = wp.get_cuda_devices()
-    first_cuda_devices = {}
-
-    for d in cuda_devices:
-        if d.arch not in first_cuda_devices:
-            first_cuda_devices[d.arch] = d
-
-    selected_cuda_devices = list(first_cuda_devices.values())
-
-    if mode == "unique_or_2x" and len(selected_cuda_devices) == 1 and len(cuda_devices) > 1:
-        for d in cuda_devices:
-            if d not in selected_cuda_devices:
-                selected_cuda_devices.append(d)
-                break
-
-    return selected_cuda_devices
+    return get_test_devices(mode, backends=("cuda",))
 
 
 def get_cpu_test_devices():
@@ -151,44 +127,74 @@ def get_cpu_test_devices():
     return []
 
 
-def get_test_devices(mode: str | None = None):
-    """Return devices based on the selected mode.
+def get_test_devices(mode: str | None = None, *, backends: tuple[str, ...] | None = None):
+    """Return devices from the selected backends using the selected mode.
 
     Args:
-        mode: The testing mode to specify which devices to include. If not provided or ``None``, the
-          ``global test_mode`` value will be used.
-          "basic": Returns the CPU and the first GPU device when available.
-          "unique": Returns the CPU and all unique GPU architectures.
-          "unique_or_2x" (default): Behaves like "unique" but adds up to one additional CUDA device
-            if the system only devices of a single CUDA architecture.
-          "all": Returns all available devices.
+        mode: Device-count policy within each selected backend. ``None`` uses
+          ``test_mode``. ``"basic"`` selects the first device, ``"unique"`` selects
+          one device per GPU architecture or SYCL device name, ``"unique_or_2x"``
+          adds a second GPU when only one architecture is present, and ``"all"``
+          selects every device. CPU selection always returns at most one device.
+        backends: Backend names in selection order, for example ``("cuda",)``,
+          ``("sycl",)``, or ``("cpu", "cuda", "sycl")``. Explicit selection is
+          respected in every mode. ``None`` preserves legacy selection: CPU and
+          CUDA by default, or every backend in ``"all"`` mode.
     """
     if mode is None:
         mode = test_mode
 
-    devices = []
-
-    if mode == "basic":
-        # only run on CPU and first GPU device
-        devices.extend(get_cpu_test_devices())
-        if wp.is_cuda_available():
-            devices.append(wp.get_device("cuda:0"))
-    elif mode == "unique" or mode == "unique_or_2x":
-        # run on CPU and a subset of GPUs
-        devices.extend(get_cpu_test_devices())
-        devices.extend(get_selected_cuda_test_devices(mode))
-    elif mode == "all":
-        # run on all devices
-        devices = wp.get_devices()
-    else:
+    if mode not in ("basic", "unique", "unique_or_2x", "all"):
         raise ValueError(f"Unknown test mode selected: {mode}")
+
+    if backends is None:
+        if mode == "all":
+            return wp.get_devices()
+        backends = ("cpu", "cuda")
+    elif isinstance(backends, str):
+        raise TypeError("backends must be a tuple of backend names, not a string")
+
+    for backend in backends:
+        if backend not in ("cpu", "cuda", "sycl"):
+            raise ValueError(f"Unknown test backend selected: {backend}")
+
+    devices = []
+    for backend in dict.fromkeys(backends):
+        if backend == "cpu":
+            devices.extend(get_cpu_test_devices())
+            continue
+
+        if backend == "cuda":
+            gpu_devices = wp.get_cuda_devices()
+        else:
+            gpu_devices = [device for device in wp.get_devices() if device.is_sycl]
+
+        if mode == "all":
+            devices.extend(gpu_devices)
+        elif mode == "basic":
+            devices.extend(gpu_devices[:1])
+        else:
+            first_devices = {}
+            for device in gpu_devices:
+                key = device.arch if backend == "cuda" else device.name
+                if key not in first_devices:
+                    first_devices[key] = device
+            selected = list(first_devices.values())
+            if mode == "unique_or_2x" and len(selected) == 1 and len(gpu_devices) > 1:
+                selected.append(gpu_devices[1])
+            devices.extend(selected)
 
     return devices
 
 
 def get_cuda_test_devices(mode=None):
-    devices = get_test_devices(mode=mode)
-    return [d for d in devices if d.is_cuda]
+    """Return only CUDA devices using the selected device-count policy."""
+    return get_test_devices(mode, backends=("cuda",))
+
+
+def get_sycl_test_devices(mode=None):
+    """Return only SYCL devices using the selected device-count policy."""
+    return get_test_devices(mode, backends=("sycl",))
 
 
 def get_cuda_device_pair_with_peer_access_support(devices=None):
@@ -221,7 +227,7 @@ def get_cuda_device_pair_with_mempool_access_support(devices=None):
     return None
 
 
-def get_test_devices_with_graph_capture_allocation(mode: str | None = None):
+def get_test_devices_with_graph_capture_allocation(mode: str | None = None, *, backends: tuple[str, ...] | None = None):
     """Like :func:`get_test_devices`, but drops devices that cannot allocate during graph capture.
 
     Use this getter to gate tests that allocate inside a graph capture so they skip
@@ -232,7 +238,7 @@ def get_test_devices_with_graph_capture_allocation(mode: str | None = None):
     """
     from warp._src.context import _is_graph_capture_allocation_supported  # noqa: PLC0415
 
-    return [d for d in get_test_devices(mode) if _is_graph_capture_allocation_supported(d)]
+    return [d for d in get_test_devices(mode, backends=backends) if _is_graph_capture_allocation_supported(d)]
 
 
 def is_cuda_graph_module_load_supported(device) -> bool:
@@ -241,19 +247,29 @@ def is_cuda_graph_module_load_supported(device) -> bool:
     return not device.is_cuda or (driver_version is not None and driver_version >= (12, 3))
 
 
-def get_test_devices_with_cuda_graph_module_load(mode: str | None = None):
+def get_test_devices_with_cuda_graph_module_load(mode: str | None = None, *, backends: tuple[str, ...] | None = None):
     """Like :func:`get_test_devices`, but drops CUDA devices using drivers older than 12.3.
 
     CUDA module loading during graph capture requires a driver supporting CUDA
     12.3 or newer. CPU devices pass through unchanged because CPU graph capture
     uses APIC recording rather than CUDA driver graph capture.
     """
-    return [d for d in get_test_devices(mode) if is_cuda_graph_module_load_supported(d)]
+    return [
+        device
+        for device in get_test_devices(mode, backends=backends)
+        if is_cuda_graph_module_load_supported(device) and (not device.is_sycl or device.supports_graph_capture)
+    ]
 
 
-def get_test_devices_with_graph_capture_allocation_and_cuda_graph_module_load(mode: str | None = None):
+def get_test_devices_with_graph_capture_allocation_and_cuda_graph_module_load(
+    mode: str | None = None, *, backends: tuple[str, ...] | None = None
+):
     """Like :func:`get_test_devices_with_graph_capture_allocation`, but also gates CUDA graph module loading."""
-    return [d for d in get_test_devices_with_graph_capture_allocation(mode) if is_cuda_graph_module_load_supported(d)]
+    return [
+        device
+        for device in get_test_devices_with_graph_capture_allocation(mode, backends=backends)
+        if is_cuda_graph_module_load_supported(device)
+    ]
 
 
 def get_cuda_test_devices_with_mempool(mode=None):
@@ -399,14 +415,14 @@ def run_python_subprocess(
     Crash dump collection is suppressed before ``source`` imports Warp: POSIX
     core dumps are disabled, while Windows Error Reporting is configured not to
     collect expected child-process failures. Set ``hide_gpu`` for CPU-only
-    children so they do not enumerate CUDA devices or create CUDA contexts.
+    children so they do not enumerate CUDA or SYCL devices or create GPU contexts.
 
     Args:
         source: Python source passed to the child interpreter with ``-c``.
         *args: Arguments exposed to ``source`` through ``sys.argv[1:]``.
         timeout: Maximum number of seconds to wait for the child.
-        hide_gpu: Whether to hide GPUs from the child by setting
-            ``CUDA_VISIBLE_DEVICES`` to an empty string.
+        hide_gpu: Whether to hide CUDA and SYCL devices using
+            ``CUDA_VISIBLE_DEVICES`` and ``ONEAPI_DEVICE_SELECTOR``.
         env_updates: Environment variables to add or replace in the inherited
             child environment.
 
@@ -422,6 +438,7 @@ def run_python_subprocess(
         env.update(env_updates)
     if hide_gpu:
         env["CUDA_VISIBLE_DEVICES"] = ""
+        env["ONEAPI_DEVICE_SELECTOR"] = "!*:*"
 
     if sys.platform == "win32":
         source = (
@@ -737,9 +754,10 @@ class ParallelJunitTestResult(unittest.TextTestResult):
     def addSubTest(self, test, subtest, err):
         super(unittest.TextTestResult, self).addSubTest(test, subtest, err)
         if err is not None:
-            self._add_helper(test, "E", "ERROR")
+            status = "FAIL" if issubclass(err[0], test.failureException) else "ERROR"
+            self._add_helper(test, "F" if status == "FAIL" else "E", status)
             # err is (class, error, traceback)
-            self._record_test(test, "FAIL", str(err[1]), self._exc_info_to_string(err, test))
+            self._record_test(test, status, str(err[1]), self._exc_info_to_string(err, test))
 
     def printErrors(self):
         pass

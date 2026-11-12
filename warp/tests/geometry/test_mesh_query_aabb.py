@@ -939,7 +939,7 @@ def test_mesh_get_bvh(test, device):
         assert_np_equal(got, expected)
 
 
-devices = get_test_devices()
+cpu_cuda_sycl_devices = get_test_devices(backends=("cpu", "cuda", "sycl"))
 
 
 class TestMeshQueryAABBMethods(unittest.TestCase):
@@ -957,57 +957,71 @@ class TestMeshQueryAABBMethods(unittest.TestCase):
         wp.Kernel(func=kernel_fn)
 
 
-add_function_test(TestMeshQueryAABBMethods, "test_compute_bounds", test_compute_bounds, devices=devices)
+add_function_test(TestMeshQueryAABBMethods, "test_compute_bounds", test_compute_bounds, devices=cpu_cuda_sycl_devices)
 add_function_test(
-    TestMeshQueryAABBMethods, "test_mesh_query_aabb_count_overlap", test_mesh_query_aabb_count_overlap, devices=devices
+    TestMeshQueryAABBMethods,
+    "test_mesh_query_aabb_count_overlap",
+    test_mesh_query_aabb_count_overlap,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestMeshQueryAABBMethods,
     "test_mesh_query_aabb_count_nonoverlap",
     test_mesh_query_aabb_count_nonoverlap,
-    devices=devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestMeshQueryAABBMethods,
     "test_mesh_query_aabb_count_overlap_with_checksum",
     test_mesh_query_aabb_count_overlap_with_checksum,
-    devices=devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestMeshQueryAABBMethods,
     "test_tile_mesh_query_aabb",
     test_tile_mesh_query_aabb,
-    devices=devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestMeshQueryAABBMethods,
     "test_tile_mesh_query_aabb_large",
     test_tile_mesh_query_aabb_large,
-    devices=devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestMeshQueryAABBMethods,
     "test_mesh_query_aabb_tiled",
     test_mesh_query_aabb_tiled,
-    devices=devices,
+    devices=cpu_cuda_sycl_devices,
 )
-add_function_test(TestMeshQueryAABBMethods, "test_mesh_query_sphere", test_mesh_query_sphere, devices=devices)
+add_function_test(
+    TestMeshQueryAABBMethods, "test_mesh_query_sphere", test_mesh_query_sphere, devices=cpu_cuda_sycl_devices
+)
 add_function_test(
     TestMeshQueryAABBMethods,
     "test_mesh_query_sphere_alias_next",
     test_mesh_query_sphere_alias_next,
-    devices=devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
-    TestMeshQueryAABBMethods, "test_mesh_query_sphere_for_loop", test_mesh_query_sphere_for_loop, devices=devices
+    TestMeshQueryAABBMethods,
+    "test_mesh_query_sphere_for_loop",
+    test_mesh_query_sphere_for_loop,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
-    TestMeshQueryAABBMethods, "test_mesh_query_runtime_kind", test_mesh_query_runtime_kind, devices=devices
+    TestMeshQueryAABBMethods,
+    "test_mesh_query_runtime_kind",
+    test_mesh_query_runtime_kind,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
-    TestMeshQueryAABBMethods, "test_mesh_query_erased_func_param", test_mesh_query_erased_func_param, devices=devices
+    TestMeshQueryAABBMethods,
+    "test_mesh_query_erased_func_param",
+    test_mesh_query_erased_func_param,
+    devices=cpu_cuda_sycl_devices,
 )
-add_function_test(TestMeshQueryAABBMethods, "test_mesh_get_bvh", test_mesh_get_bvh, devices=devices)
+add_function_test(TestMeshQueryAABBMethods, "test_mesh_get_bvh", test_mesh_get_bvh, devices=cpu_cuda_sycl_devices)
 
 for name, func in (
     ("test_tile_mesh_query_aabb", test_tile_mesh_query_aabb),

@@ -294,26 +294,26 @@ def test_atomic_max_unsupported_dtypes(test, device, dtype):
         wp.launch(kernel, dim=1, outputs=(arr,), device=device)
 
 
-devices = get_test_devices()
+cpu_cuda_sycl_devices = get_test_devices(backends=("cpu", "cuda", "sycl"))
 
 
 class TestAtomic(unittest.TestCase):
     pass
 
 
-add_function_test(TestAtomic, "test_atomic_int", test_atomic_int, devices=devices)
-add_function_test(TestAtomic, "test_atomic_float", test_atomic_float, devices=devices)
-add_function_test(TestAtomic, "test_atomic_double", test_atomic_double, devices=devices)
-add_function_test(TestAtomic, "test_atomic_vec2", test_atomic_vec2, devices=devices)
-add_function_test(TestAtomic, "test_atomic_vec3", test_atomic_vec3, devices=devices)
-add_function_test(TestAtomic, "test_atomic_vec4", test_atomic_vec4, devices=devices)
-add_function_test(TestAtomic, "test_atomic_mat22", test_atomic_mat22, devices=devices)
-add_function_test(TestAtomic, "test_atomic_mat33", test_atomic_mat33, devices=devices)
-add_function_test(TestAtomic, "test_atomic_mat44", test_atomic_mat44, devices=devices)
-add_function_test(TestAtomic, "test_atomic_return_int", test_atomic_return_int, devices=devices)
-add_function_test(TestAtomic, "test_atomic_return_long", test_atomic_return_long, devices=devices)
-add_function_test(TestAtomic, "test_atomic_return_float", test_atomic_return_float, devices=devices)
-add_function_test(TestAtomic, "test_atomic_return_double", test_atomic_return_double, devices=devices)
+add_function_test(TestAtomic, "test_atomic_int", test_atomic_int, devices=cpu_cuda_sycl_devices)
+add_function_test(TestAtomic, "test_atomic_float", test_atomic_float, devices=cpu_cuda_sycl_devices)
+add_function_test(TestAtomic, "test_atomic_double", test_atomic_double, devices=cpu_cuda_sycl_devices)
+add_function_test(TestAtomic, "test_atomic_vec2", test_atomic_vec2, devices=cpu_cuda_sycl_devices)
+add_function_test(TestAtomic, "test_atomic_vec3", test_atomic_vec3, devices=cpu_cuda_sycl_devices)
+add_function_test(TestAtomic, "test_atomic_vec4", test_atomic_vec4, devices=cpu_cuda_sycl_devices)
+add_function_test(TestAtomic, "test_atomic_mat22", test_atomic_mat22, devices=cpu_cuda_sycl_devices)
+add_function_test(TestAtomic, "test_atomic_mat33", test_atomic_mat33, devices=cpu_cuda_sycl_devices)
+add_function_test(TestAtomic, "test_atomic_mat44", test_atomic_mat44, devices=cpu_cuda_sycl_devices)
+add_function_test(TestAtomic, "test_atomic_return_int", test_atomic_return_int, devices=cpu_cuda_sycl_devices)
+add_function_test(TestAtomic, "test_atomic_return_long", test_atomic_return_long, devices=cpu_cuda_sycl_devices)
+add_function_test(TestAtomic, "test_atomic_return_float", test_atomic_return_float, devices=cpu_cuda_sycl_devices)
+add_function_test(TestAtomic, "test_atomic_return_double", test_atomic_return_double, devices=cpu_cuda_sycl_devices)
 
 for dtype in (
     wp.int32,
@@ -334,7 +334,11 @@ for dtype in (
 ):
     scalar_type = getattr(dtype, "_wp_scalar_type_", dtype)
     # bfloat16 requires arch >= 80
-    dtype_devices = [d for d in devices if not d.is_cuda or d.arch >= 80] if scalar_type is wp.bfloat16 else devices
+    dtype_devices = (
+        [d for d in cpu_cuda_sycl_devices if not d.is_cuda or d.arch >= 80]
+        if scalar_type is wp.bfloat16
+        else cpu_cuda_sycl_devices
+    )
 
     add_function_test(
         TestAtomic,
@@ -384,7 +388,7 @@ for dtype in (
             TestAtomic,
             f"test_atomic_add_unsupported_dtypes_{dtype.__name__}",
             test_atomic_add_unsupported_dtypes,
-            devices=devices,
+            devices=cpu_cuda_sycl_devices,
             dtype=dtype,
         )
 
@@ -392,7 +396,7 @@ for dtype in (
         TestAtomic,
         f"test_atomic_min_unsupported_dtypes_{dtype.__name__}",
         test_atomic_min_unsupported_dtypes,
-        devices=devices,
+        devices=cpu_cuda_sycl_devices,
         dtype=dtype,
     )
 
@@ -400,7 +404,7 @@ for dtype in (
         TestAtomic,
         f"test_atomic_max_unsupported_dtypes_{dtype.__name__}",
         test_atomic_max_unsupported_dtypes,
-        devices=devices,
+        devices=cpu_cuda_sycl_devices,
         dtype=dtype,
     )
 

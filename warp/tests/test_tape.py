@@ -778,7 +778,7 @@ def test_tape_copy_adjoint_fallback_warning(test, device):
     test.assertEqual(mock_log_warning.call_args.kwargs.get("stacklevel"), 5)
     test.assertIs(mock_log_warning.call_args.kwargs.get("once"), True)
 
-    if device.is_cuda:
+    if device.is_cuda or device.is_sycl:
         base_cpu = wp.zeros((n, 2), dtype=float, requires_grad=True, device="cpu")
         src_cuda = wp.ones(n, dtype=float, requires_grad=True, device=device)
         loss_cpu = wp.zeros(1, dtype=float, requires_grad=True, device="cpu")
@@ -1014,7 +1014,7 @@ def test_tape_backward_cuda_launch_failure(test, device):
         tape.backward(grads={y: wp.ones_like(y)})
 
 
-devices = get_test_devices()
+cpu_cuda_sycl_devices = get_test_devices(backends=("cpu", "cuda", "sycl"))
 cuda_devices = get_cuda_test_devices()
 
 
@@ -1070,28 +1070,47 @@ class TestTape(unittest.TestCase):
         self.assertEqual(tape.scopes, [])
 
 
-add_function_test(TestTape, "test_tape_mul_constant", test_tape_mul_constant, devices=devices)
-add_function_test(TestTape, "test_tape_mul_variable", test_tape_mul_variable, devices=devices)
-add_function_test(TestTape, "test_tape_dot_product", test_tape_dot_product, devices=devices)
-add_function_test(TestTape, "test_tape_record_func_jacobi", test_tape_record_func_jacobi, devices=devices)
+add_function_test(TestTape, "test_tape_mul_constant", test_tape_mul_constant, devices=cpu_cuda_sycl_devices)
+add_function_test(TestTape, "test_tape_mul_variable", test_tape_mul_variable, devices=cpu_cuda_sycl_devices)
+add_function_test(TestTape, "test_tape_dot_product", test_tape_dot_product, devices=cpu_cuda_sycl_devices)
+add_function_test(TestTape, "test_tape_record_func_jacobi", test_tape_record_func_jacobi, devices=cpu_cuda_sycl_devices)
 add_function_test(
     TestTape, "test_tape_record_func_jacobi_capture", test_tape_record_func_jacobi, devices=cuda_devices, capture=True
 )
-add_function_test(TestTape, "test_tape_zero_multiple_outputs", test_tape_zero_multiple_outputs, devices=devices)
-add_function_test(TestTape, "test_tape_nested_struct", test_tape_nested_struct, devices=devices)
-add_function_test(TestTape, "test_tape_visualize", test_tape_visualize, devices=devices)
-add_function_test(TestTape, "test_tape_struct_subscript", test_tape_struct_subscript, devices=devices)
-add_function_test(TestTape, "test_tape_nested_struct_subscript", test_tape_nested_struct_subscript, devices=devices)
-add_function_test(TestTape, "test_tape_visualize_subscript", test_tape_visualize_subscript, devices=devices)
-add_function_test(TestTape, "test_tape_copy_adjoint_accumulation", test_tape_copy_adjoint_accumulation, devices=devices)
-add_function_test(TestTape, "test_tape_copy_adjoint_consumption", test_tape_copy_adjoint_consumption, devices=devices)
 add_function_test(
-    TestTape, "test_tape_copy_adjoint_views_and_offsets", test_tape_copy_adjoint_views_and_offsets, devices=devices
+    TestTape, "test_tape_zero_multiple_outputs", test_tape_zero_multiple_outputs, devices=cpu_cuda_sycl_devices
 )
-add_function_test(TestTape, "test_tape_copy_adjoint_out_of_scope", test_tape_copy_adjoint_out_of_scope, devices=devices)
+add_function_test(TestTape, "test_tape_nested_struct", test_tape_nested_struct, devices=cpu_cuda_sycl_devices)
+add_function_test(TestTape, "test_tape_visualize", test_tape_visualize, devices=cpu_cuda_sycl_devices)
+add_function_test(TestTape, "test_tape_struct_subscript", test_tape_struct_subscript, devices=cpu_cuda_sycl_devices)
 add_function_test(
-    TestTape, "test_tape_copy_adjoint_fallback_warning", test_tape_copy_adjoint_fallback_warning, devices=devices
+    TestTape, "test_tape_nested_struct_subscript", test_tape_nested_struct_subscript, devices=cpu_cuda_sycl_devices
 )
+add_function_test(
+    TestTape, "test_tape_visualize_subscript", test_tape_visualize_subscript, devices=cpu_cuda_sycl_devices
+)
+add_function_test(
+    TestTape, "test_tape_copy_adjoint_accumulation", test_tape_copy_adjoint_accumulation, devices=cpu_cuda_sycl_devices
+)
+add_function_test(
+    TestTape, "test_tape_copy_adjoint_consumption", test_tape_copy_adjoint_consumption, devices=cpu_cuda_sycl_devices
+)
+add_function_test(
+    TestTape,
+    "test_tape_copy_adjoint_views_and_offsets",
+    test_tape_copy_adjoint_views_and_offsets,
+    devices=cpu_cuda_sycl_devices,
+)
+add_function_test(
+    TestTape, "test_tape_copy_adjoint_out_of_scope", test_tape_copy_adjoint_out_of_scope, devices=cpu_cuda_sycl_devices
+)
+add_function_test(
+    TestTape,
+    "test_tape_copy_adjoint_fallback_warning",
+    test_tape_copy_adjoint_fallback_warning,
+    devices=cpu_cuda_sycl_devices,
+)
+# TODO: add sycl support
 add_function_test(TestTape, "test_tape_copy_adjoint_cpu_cuda", test_tape_copy_adjoint_cpu_cuda, devices=cuda_devices)
 add_function_test(TestTape, "test_tape_copy_adjoint_stream", test_tape_copy_adjoint_stream, devices=cuda_devices)
 add_function_test(

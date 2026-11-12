@@ -376,7 +376,7 @@ def test_tile_sort_surviving_lane_heap_backed_cpu(test, device):
     test.assertIn("ok", result.stdout)
 
 
-devices = get_test_devices()
+cpu_cuda_sycl_devices = get_test_devices(backends=("cpu", "cuda", "sycl"))
 
 
 class TestTileSort(unittest.TestCase):
@@ -387,13 +387,18 @@ add_function_test(
     TestTileSort,
     "test_tile_sort_keys_and_values_across_dtypes_and_sizes",
     test_tile_sort_keys_and_values_across_dtypes_and_sizes,
-    devices=devices,
+    devices=cpu_cuda_sycl_devices,
 )
-add_function_test(TestTileSort, "test_tile_sort_bfloat16_payload", test_tile_sort_bfloat16_payload, devices=devices)
 add_function_test(
-    TestTileSort, "test_tile_sort_key_value_permutation", test_tile_sort_key_value_permutation, devices=devices
+    TestTileSort, "test_tile_sort_bfloat16_payload", test_tile_sort_bfloat16_payload, devices=cpu_cuda_sycl_devices
 )
-add_function_test(TestTileSort, "test_tile_sort_payloads", test_tile_sort_payloads, devices=devices)
+add_function_test(
+    TestTileSort,
+    "test_tile_sort_key_value_permutation",
+    test_tile_sort_key_value_permutation,
+    devices=cpu_cuda_sycl_devices,
+)
+add_function_test(TestTileSort, "test_tile_sort_payloads", test_tile_sort_payloads, devices=cpu_cuda_sycl_devices)
 add_function_test(
     TestTileSort,
     "test_tile_sort_heap_backed_cpu",

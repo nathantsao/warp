@@ -9,6 +9,24 @@ import warp as wp
 from warp.tests.unittest_utils import *
 
 
+def test_devices_graph_capabilities(test, device):
+    if device.is_sycl:
+        library = wp._src.context.runtime.sycl
+        test.assertIs(device.supports_graph_capture, bool(library.wp_sycl_graph_supported(device.context)))
+        test.assertIs(
+            device.is_graph_capture_event_supported, bool(library.wp_sycl_graph_event_supported(device.context))
+        )
+        test.assertFalse(device.is_conditional_graph_supported)
+    elif device.is_cuda:
+        test.assertTrue(device.supports_graph_capture)
+        test.assertTrue(device.is_graph_capture_event_supported)
+        test.assertIs(device.is_conditional_graph_supported, wp.is_conditional_graph_supported())
+    else:
+        test.assertTrue(device.supports_graph_capture)
+        test.assertFalse(device.is_graph_capture_event_supported)
+        test.assertTrue(device.is_conditional_graph_supported)
+
+
 def test_devices_get_cuda_device_functions(test, device):
     test.assertTrue(device.is_cuda)
     test.assertTrue(wp.is_device_available(device))
@@ -47,7 +65,6 @@ def test_devices_verify_cuda_device(test, device):
     wp.config.verify_cuda = verify_cuda_saved
 
 
-@unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
 def test_devices_can_access_self(test, device):
     test.assertTrue(device.can_access(device))
 
@@ -67,64 +84,30 @@ def test_devices_can_access_self(test, device):
                 test.assertEqual(device.can_access(warp_device), wp.is_mempool_access_enabled(warp_device, device))
             else:
                 test.assertEqual(device.can_access(warp_device), wp.is_peer_access_enabled(warp_device, device))
+        elif (device.is_sycl or warp_device.is_sycl) and device != warp_device:
+            test.assertFalse(device.can_access(warp_device))
+            test.assertNotEqual(device, warp_device)
+            test.assertNotEqual(device, device_str)
 
 
 def test_devices_sm_count(test, device):
-    if device.is_cuda:
+    if device.is_cuda or device.is_sycl:
         test.assertTrue(device.sm_count > 0)
     else:
         test.assertEqual(device.sm_count, 0)
 
 
 def test_devices_max_shared_memory_per_block(test, device):
-    if device.is_cuda:
+    if device.is_cuda or device.is_sycl:
         test.assertTrue(device.max_shared_memory_per_block > 0)
     else:
         test.assertEqual(device.max_shared_memory_per_block, 0)
 
 
-devices = get_test_devices()
+devices = get_test_devices(backends=("cpu", "cuda", "sycl"))
 
 
 class TestDevices(unittest.TestCase):
-    def test_devices_graph_capabilities(self):
-        runtime = wp._src.context.runtime
-        for device in wp.get_devices():
-            with self.subTest(device=device):
-                if device.is_sycl:
-                    self.assertIs(
-                        device.supports_graph_capture,
-                        bool(runtime.sycl.wp_sycl_graph_supported(device.context)),
-                    )
-                    self.assertIs(
-                        device.is_graph_capture_event_supported,
-                        bool(runtime.sycl.wp_sycl_graph_event_supported(device.context)),
-                    )
-                    self.assertFalse(device.is_conditional_graph_supported)
-                else:
-                    self.assertTrue(device.supports_graph_capture)
-                    self.assertIs(device.is_graph_capture_event_supported, device.is_cuda)
-                    self.assertIs(
-                        device.is_conditional_graph_supported,
-                        device.is_cpu or wp.is_conditional_graph_supported(),
-                    )
-
-    def test_devices_graph_capabilities_sycl(self):
-        device = object.__new__(wp.Device)
-        device.backend = "sycl"
-        device._context = mock.sentinel.sycl_context
-        native = mock.Mock(spec=("wp_sycl_graph_supported", "wp_sycl_graph_event_supported"))
-        with mock.patch.object(wp._src.context.runtime, "sycl", native):
-            for graphs, events in ((False, False), (True, False), (True, True)):
-                with self.subTest(graphs=graphs, events=events):
-                    native.wp_sycl_graph_supported.return_value = int(graphs)
-                    native.wp_sycl_graph_event_supported.return_value = int(events)
-                    self.assertIs(device.supports_graph_capture, graphs)
-                    self.assertIs(device.is_graph_capture_event_supported, events)
-                    self.assertFalse(device.is_conditional_graph_supported)
-                    native.wp_sycl_graph_supported.assert_called_with(device.context)
-                    native.wp_sycl_graph_event_supported.assert_called_with(device.context)
-
     def test_devices_conditional_graph_capability_cuda_versions(self):
         device = object.__new__(wp.Device)
         device.backend = "cuda"
@@ -240,7 +223,13 @@ add_function_test(
 add_function_test(
     TestDevices, "test_devices_map_cuda_device", test_devices_map_cuda_device, devices=get_selected_cuda_test_devices()
 )
-add_function_test(TestDevices, "test_devices_verify_cuda_device", test_devices_verify_cuda_device, devices=devices)
+add_function_test(TestDevices, "test_devices_graph_capabilities", test_devices_graph_capabilities, devices=devices)
+add_function_test(
+    TestDevices,
+    "test_devices_verify_cuda_device",
+    test_devices_verify_cuda_device,
+    devices=get_test_devices(backends=("cpu", "cuda")),
+)
 add_function_test(TestDevices, "test_devices_can_access_self", test_devices_can_access_self, devices=devices)
 add_function_test(TestDevices, "test_devices_sm_count", test_devices_sm_count, devices=devices)
 add_function_test(

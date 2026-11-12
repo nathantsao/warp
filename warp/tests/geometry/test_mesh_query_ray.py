@@ -842,7 +842,7 @@ def test_mesh_query_ray_parallel_slab_boundaries(test, device):
             test.assertEqual(anyhit_np[i], 1, f"[{constructor}] {label}: expected any-hit query to hit")
 
 
-devices = get_test_devices()
+cpu_cuda_sycl_devices = get_test_devices(backends=("cpu", "cuda", "sycl"))
 
 
 class TestMeshQueryRay(unittest.TestCase):
@@ -861,21 +861,23 @@ class TestMeshQueryRay(unittest.TestCase):
         wp.Kernel(func=kernel_fn)
 
 
-add_function_test(TestMeshQueryRay, "test_mesh_query_ray_edge", test_mesh_query_ray_edge, devices=devices)
+add_function_test(TestMeshQueryRay, "test_mesh_query_ray_edge", test_mesh_query_ray_edge, devices=cpu_cuda_sycl_devices)
 add_function_test(
     TestMeshQueryRay,
     "test_mesh_query_ray_parallel_slab_boundaries",
     test_mesh_query_ray_parallel_slab_boundaries,
-    devices=devices,
+    devices=cpu_cuda_sycl_devices,
 )
-add_function_test(TestMeshQueryRay, "test_mesh_query_ray_grad", test_mesh_query_ray_grad, devices=devices)
+add_function_test(TestMeshQueryRay, "test_mesh_query_ray_grad", test_mesh_query_ray_grad, devices=cpu_cuda_sycl_devices)
 add_function_test(
     TestMeshQueryRay,
     "test_mesh_query_ray_count_intersections",
     test_mesh_query_ray_count_intersections,
-    devices=devices,
+    devices=cpu_cuda_sycl_devices,
 )
-add_function_test(TestMeshQueryRay, "test_mesh_query_ray_and_groups", test_mesh_query_ray_and_groups, devices=devices)
+add_function_test(
+    TestMeshQueryRay, "test_mesh_query_ray_and_groups", test_mesh_query_ray_and_groups, devices=cpu_cuda_sycl_devices
+)
 
 
 if __name__ == "__main__":

@@ -4079,7 +4079,81 @@ def test_graph_fill_vecmat(test, device):
         _run_tests(indexed_arrays)
 
 
-devices = get_test_devices()
+def test_device_array_interface(test, device):
+    device = wp.get_device(device)
+    if device.is_cpu:
+        source = wp.zeros(4, device=device)
+        test.assertFalse(hasattr(source, "__cuda_array_interface__"))
+        test.assertFalse(hasattr(source, "__sycl_usm_array_interface__"))
+        return
+
+    name = "__sycl_usm_array_interface__" if device.is_sycl else "__cuda_array_interface__"
+    for dtype, shape in ((wp.float32, (4,)), (wp.vec3, (4, 3)), (wp.mat33, (4, 3, 3))):
+        with test.subTest(dtype=dtype):
+            expected = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+            source = wp.array(expected, dtype=dtype, device=device)
+            reverse = wp.array(
+                ptr=source.ptr + 3 * source.strides[0],
+                dtype=dtype,
+                shape=source.shape,
+                strides=(-source.strides[0],),
+                device=device,
+            )
+            for view in (source, source[::2], reverse, source[:0]):
+                interface = getattr(view, name)
+                test.assertEqual(interface["data"], (view.ptr or 0, False))
+                test.assertEqual(interface["shape"], (view.shape[0], *shape[1:]))
+                scalar_strides = (*view.strides, *expected.strides[1:])
+                unit = expected.itemsize if device.is_sycl else 1
+                test.assertEqual(interface["strides"], tuple(stride // unit for stride in scalar_strides))
+                test.assertEqual(np.dtype(interface["typestr"]), expected.dtype)
+                test.assertEqual(interface["version"], 1 if device.is_sycl else 2)
+                alias = wp.array(view, dtype=dtype, device=device)
+                test.assertEqual(alias.ptr, view.ptr)
+                test.assertEqual(alias.strides, view.strides)
+                test.assertIs(alias._ref, view)
+                assert_np_equal(alias.numpy(), view.numpy())
+
+
+def test_sycl_usm_array_interface(test, device):
+    class Provider:
+        def __init__(self, source, **metadata):
+            self.source = source
+            self.__sycl_usm_array_interface__ = {**source.__sycl_usm_array_interface__, **metadata}
+
+    source = wp.array(np.arange(12, dtype=np.float32), device=device)
+    provider = Provider(source, shape=(3,), strides=(2,), offset=1)
+    alias = wp.array(provider, device=device)
+    test.assertEqual(alias.ptr, source.ptr + 4)
+    test.assertEqual(alias.strides, (8,))
+    test.assertIs(alias._ref, provider)
+    assert_np_equal(alias.numpy(), np.array([1, 3, 5], dtype=np.float32))
+    contiguous = wp.array(Provider(source, strides=None), device=device)
+    assert_np_equal(contiguous.numpy(), source.numpy())
+
+    with test.assertRaisesRegex(ValueError, "Read-only"):
+        wp.array(Provider(source, data=(source.ptr, True)), device=device)
+    with test.assertRaisesRegex(ValueError, "version"):
+        wp.array(Provider(source, version=2), device=device)
+    with test.assertRaisesRegex(TypeError, "SyclQueueRef"):
+        wp.array(Provider(source, syclobj=None), device=device)
+    for other in get_test_devices(backends=("sycl",)):
+        if other != wp.get_device(device):
+            with test.assertRaises(RuntimeError):
+                wp.array(source, device=other)
+
+    producer = wp.Stream(device)
+    consumer = wp.Stream(device)
+    with wp.ScopedStream(producer):
+        source.fill_(7)
+        provider = Provider(source)
+    with wp.ScopedStream(consumer):
+        alias = wp.array(provider, device=device)
+        result = wp.clone(alias)
+        assert_np_equal(result.numpy(), np.full(12, 7, dtype=np.float32))
+
+
+cpu_cuda_sycl_devices = get_test_devices(backends=("cpu", "cuda", "sycl"))
 cuda_devices = get_cuda_test_devices()
 
 
@@ -4189,91 +4263,120 @@ class TestArray(unittest.TestCase):
         self.assertEqual(sliced2.shape, (512, 256, 2))
 
 
-add_function_test(TestArray, "test_shape", test_shape, devices=devices)
-add_function_test(TestArray, "test_negative_shape", test_negative_shape, devices=devices)
-add_function_test(TestArray, "test_flatten", test_flatten, devices=devices)
-add_function_test(TestArray, "test_reshape", test_reshape, devices=devices)
+add_function_test(TestArray, "test_shape", test_shape, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_negative_shape", test_negative_shape, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_flatten", test_flatten, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_reshape", test_reshape, devices=cpu_cuda_sycl_devices)
 
-add_function_test(TestArray, "test_slicing", test_slicing, devices=devices)
-add_function_test(TestArray, "test_transpose", test_transpose, devices=devices)
-add_function_test(TestArray, "test_view", test_view, devices=devices)
-add_function_test(TestArray, "test_clone_adjoint", test_clone_adjoint, devices=devices)
-add_function_test(TestArray, "test_assign_adjoint", test_assign_adjoint, devices=devices)
+add_function_test(TestArray, "test_slicing", test_slicing, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_transpose", test_transpose, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_view", test_view, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_clone_adjoint", test_clone_adjoint, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_assign_adjoint", test_assign_adjoint, devices=cpu_cuda_sycl_devices)
 
-add_function_test(TestArray, "test_1d_array", test_1d, devices=devices)
-add_function_test(TestArray, "test_2d_array", test_2d, devices=devices)
-add_function_test(TestArray, "test_3d_array", test_3d, devices=devices)
-add_function_test(TestArray, "test_4d_array", test_4d, devices=devices)
-add_function_test(TestArray, "test_4d_array_transposed", test_4d_transposed, devices=devices)
+add_function_test(TestArray, "test_1d_array", test_1d, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_2d_array", test_2d, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_3d_array", test_3d, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_4d_array", test_4d, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_4d_array_transposed", test_4d_transposed, devices=cpu_cuda_sycl_devices)
 
-add_function_test(TestArray, "test_fill_scalar", test_fill_scalar, devices=devices)
-add_function_test(TestArray, "test_fill_vector", test_fill_vector, devices=devices)
-add_function_test(TestArray, "test_fill_matrix", test_fill_matrix, devices=devices)
-add_function_test(TestArray, "test_fill_struct", test_fill_struct, devices=devices)
-add_function_test(TestArray, "test_fill_slices", test_fill_slices, devices=devices)
-add_function_test(TestArray, "test_full_scalar", test_full_scalar, devices=devices)
-add_function_test(TestArray, "test_full_vector", test_full_vector, devices=devices)
-add_function_test(TestArray, "test_full_matrix", test_full_matrix, devices=devices)
-add_function_test(TestArray, "test_full_struct", test_full_struct, devices=devices)
-add_function_test(TestArray, "test_ones_scalar", test_ones_scalar, devices=devices)
-add_function_test(TestArray, "test_ones_vector", test_ones_vector, devices=devices)
-add_function_test(TestArray, "test_ones_matrix", test_ones_matrix, devices=devices)
-add_function_test(TestArray, "test_ones_like_scalar", test_ones_like_scalar, devices=devices)
-add_function_test(TestArray, "test_ones_like_vector", test_ones_like_vector, devices=devices)
-add_function_test(TestArray, "test_ones_like_matrix", test_ones_like_matrix, devices=devices)
-add_function_test(TestArray, "test_empty_array", test_empty_array, devices=devices)
-add_function_test(TestArray, "test_empty_from_numpy", test_empty_from_numpy, devices=devices)
-add_function_test(TestArray, "test_empty_from_list", test_empty_from_list, devices=devices)
-add_function_test(TestArray, "test_to_list_scalar", test_to_list_scalar, devices=devices)
-add_function_test(TestArray, "test_to_list_vector", test_to_list_vector, devices=devices)
-add_function_test(TestArray, "test_to_list_matrix", test_to_list_matrix, devices=devices)
-add_function_test(TestArray, "test_to_list_struct", test_to_list_struct, devices=devices)
-add_function_test(TestArray, "test_to_list_python_types", test_to_list_python_types, devices=devices)
+add_function_test(TestArray, "test_fill_scalar", test_fill_scalar, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_fill_vector", test_fill_vector, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_fill_matrix", test_fill_matrix, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_fill_struct", test_fill_struct, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_fill_slices", test_fill_slices, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_full_scalar", test_full_scalar, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_full_vector", test_full_vector, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_full_matrix", test_full_matrix, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_full_struct", test_full_struct, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_ones_scalar", test_ones_scalar, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_ones_vector", test_ones_vector, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_ones_matrix", test_ones_matrix, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_ones_like_scalar", test_ones_like_scalar, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_ones_like_vector", test_ones_like_vector, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_ones_like_matrix", test_ones_like_matrix, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_empty_array", test_empty_array, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_empty_from_numpy", test_empty_from_numpy, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_empty_from_list", test_empty_from_list, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_to_list_scalar", test_to_list_scalar, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_to_list_vector", test_to_list_vector, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_to_list_matrix", test_to_list_matrix, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_to_list_struct", test_to_list_struct, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_to_list_python_types", test_to_list_python_types, devices=cpu_cuda_sycl_devices)
 
-add_function_test(TestArray, "test_lower_bound", test_lower_bound, devices=devices)
-add_function_test(TestArray, "test_round_trip", test_round_trip, devices=devices)
-add_function_test(TestArray, "test_array_to_bool", test_array_to_bool, devices=devices)
-add_function_test(TestArray, "test_array_of_structs", test_array_of_structs, devices=devices)
-add_function_test(TestArray, "test_array_of_structs_grad", test_array_of_structs_grad, devices=devices)
-add_function_test(TestArray, "test_array_of_structs_from_numpy", test_array_of_structs_from_numpy, devices=devices)
-add_function_test(TestArray, "test_array_of_structs_roundtrip", test_array_of_structs_roundtrip, devices=devices)
-add_function_test(TestArray, "test_array_from_numpy", test_array_from_numpy, devices=devices)
+add_function_test(TestArray, "test_lower_bound", test_lower_bound, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_round_trip", test_round_trip, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_array_to_bool", test_array_to_bool, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_array_of_structs", test_array_of_structs, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_array_of_structs_grad", test_array_of_structs_grad, devices=cpu_cuda_sycl_devices)
+add_function_test(
+    TestArray, "test_array_of_structs_from_numpy", test_array_of_structs_from_numpy, devices=cpu_cuda_sycl_devices
+)
+add_function_test(
+    TestArray, "test_array_of_structs_roundtrip", test_array_of_structs_roundtrip, devices=cpu_cuda_sycl_devices
+)
+add_function_test(TestArray, "test_array_from_numpy", test_array_from_numpy, devices=cpu_cuda_sycl_devices)
 add_function_test(TestArray, "test_array_aliasing_from_numpy", test_array_aliasing_from_numpy, devices=["cpu"])
 add_function_test(TestArray, "test_numpy_array_interface", test_numpy_array_interface, devices=["cpu"])
 add_function_test(TestArray, "test_numpy_array_interface_empty", test_numpy_array_interface_empty, devices=["cpu"])
-
-add_function_test(TestArray, "test_array_inplace_diff_ops", test_array_inplace_diff_ops, devices=devices)
-add_function_test(TestArray, "test_array_inplace_non_diff_ops", test_array_inplace_non_diff_ops, devices=devices)
-add_function_test(TestArray, "test_direct_from_numpy", test_direct_from_numpy, devices=["cpu"])
-add_function_test(TestArray, "test_kernel_array_from_ptr", test_kernel_array_from_ptr, devices=devices)
-add_function_test(TestArray, "test_kernel_array_from_ptr_struct", test_kernel_array_from_ptr_struct, devices=devices)
+add_function_test(TestArray, "test_array_inplace_diff_ops", test_array_inplace_diff_ops, devices=cpu_cuda_sycl_devices)
 add_function_test(
-    TestArray, "test_kernel_array_from_ptr_variable_shape", test_kernel_array_from_ptr_variable_shape, devices=devices
+    TestArray, "test_array_inplace_non_diff_ops", test_array_inplace_non_diff_ops, devices=cpu_cuda_sycl_devices
 )
-add_function_test(TestArray, "test_array_overwrite", test_array_overwrite, devices=devices)
-add_function_test(TestArray, "test_retain_grad", test_retain_grad, devices=devices)
-add_function_test(TestArray, "test_retain_grad_validation", test_retain_grad_validation, devices=devices)
-add_function_test(TestArray, "test_retain_grad_intermediate", test_retain_grad_intermediate, devices=devices)
-add_function_test(TestArray, "test_retain_grad_2d", test_retain_grad_2d, devices=devices)
-add_function_test(TestArray, "test_retain_grad_slice_view_store", test_retain_grad_slice_view_store, devices=devices)
+add_function_test(TestArray, "test_direct_from_numpy", test_direct_from_numpy, devices=["cpu"])
+add_function_test(TestArray, "test_kernel_array_from_ptr", test_kernel_array_from_ptr, devices=cpu_cuda_sycl_devices)
+add_function_test(
+    TestArray, "test_kernel_array_from_ptr_struct", test_kernel_array_from_ptr_struct, devices=cpu_cuda_sycl_devices
+)
+add_function_test(
+    TestArray,
+    "test_kernel_array_from_ptr_variable_shape",
+    test_kernel_array_from_ptr_variable_shape,
+    devices=cpu_cuda_sycl_devices,
+)
+add_function_test(TestArray, "test_array_overwrite", test_array_overwrite, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_retain_grad", test_retain_grad, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_retain_grad_validation", test_retain_grad_validation, devices=cpu_cuda_sycl_devices)
+add_function_test(
+    TestArray, "test_retain_grad_intermediate", test_retain_grad_intermediate, devices=cpu_cuda_sycl_devices
+)
+add_function_test(TestArray, "test_retain_grad_2d", test_retain_grad_2d, devices=cpu_cuda_sycl_devices)
+add_function_test(
+    TestArray, "test_retain_grad_slice_view_store", test_retain_grad_slice_view_store, devices=cpu_cuda_sycl_devices
+)
 
-add_function_test(TestArray, "test_array_shape_int_promotion", test_array_shape_int_promotion, devices=devices)
-add_function_test(TestArray, "test_indexing_types", test_indexing_types, devices=devices)
+add_function_test(
+    TestArray, "test_array_shape_int_promotion", test_array_shape_int_promotion, devices=cpu_cuda_sycl_devices
+)
+add_function_test(TestArray, "test_indexing_types", test_indexing_types, devices=cpu_cuda_sycl_devices)
 
-add_function_test(TestArray, "test_alloc_strides", test_alloc_strides, devices=devices)
-add_function_test(TestArray, "test_casting", test_casting, devices=devices)
-add_function_test(TestArray, "test_array_len", test_array_len, devices=devices)
-add_function_test(TestArray, "test_cuda_interface_conversion", test_cuda_interface_conversion, devices=devices)
-add_function_test(TestArray, "test_array_from_data", test_array_from_data, devices=devices)
+add_function_test(TestArray, "test_alloc_strides", test_alloc_strides, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_casting", test_casting, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_array_len", test_array_len, devices=cpu_cuda_sycl_devices)
+add_function_test(
+    TestArray, "test_cuda_interface_conversion", test_cuda_interface_conversion, devices=cpu_cuda_sycl_devices
+)
+add_function_test(TestArray, "test_array_from_data", test_array_from_data, devices=cpu_cuda_sycl_devices)
 
-add_function_test(TestArray, "test_array1d_slicing", test_array1d_slicing, devices=devices)
-add_function_test(TestArray, "test_array2d_slicing", test_array2d_slicing, devices=devices)
-add_function_test(TestArray, "test_array3d_slicing", test_array3d_slicing, devices=devices)
-add_function_test(TestArray, "test_array4d_slicing", test_array4d_slicing, devices=devices)
-add_function_test(TestArray, "test_dynamic_array_slice", test_dynamic_array_slice, devices=devices)
-add_function_test(TestArray, "test_array_runtime_zero_step", test_array_runtime_zero_step, devices=devices)
-
+add_function_test(TestArray, "test_array1d_slicing", test_array1d_slicing, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_array2d_slicing", test_array2d_slicing, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_array3d_slicing", test_array3d_slicing, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_array4d_slicing", test_array4d_slicing, devices=cpu_cuda_sycl_devices)
+add_function_test(TestArray, "test_dynamic_array_slice", test_dynamic_array_slice, devices=cpu_cuda_sycl_devices)
+add_function_test(
+    TestArray, "test_array_runtime_zero_step", test_array_runtime_zero_step, devices=cpu_cuda_sycl_devices
+)
+# TODO: add sycl support
 add_function_test(TestArray, "test_graph_fill_vecmat", test_graph_fill_vecmat, devices=cuda_devices)
+
+# New SYCL Tests
+add_function_test(TestArray, "test_device_array_interface", test_device_array_interface, devices=cpu_cuda_sycl_devices)
+add_function_test(
+    TestArray,
+    "test_sycl_usm_array_interface",
+    test_sycl_usm_array_interface,
+    devices=get_test_devices(backends=("sycl",)),
+)
 
 try:
     import torch

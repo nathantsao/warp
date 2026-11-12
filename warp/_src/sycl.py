@@ -3,6 +3,8 @@
 
 import ctypes
 
+import numpy as np
+
 from warp._src.types import array_t, float32, float64, int32, int64, uint32, uint64
 
 # Type codes shared with warp/native/warp_sycl.cpp (scan) and warp/native/sort_sycl.cpp (sort).
@@ -125,6 +127,57 @@ def prepare_dlpack_export(wp_array, queue: int | None) -> None:
             return
     # Compare queue identities, not external object addresses, which can be reused.
     consumers.append(Stream(device, sycl_queue=queue))
+
+
+_queue_capsule_refs = {}
+
+
+@ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+def _queue_capsule_deleter(ptr):
+    _queue_capsule_refs.pop(ptr, None)
+
+
+def queue_to_capsule(stream):
+    from warp._src.dlpack import PyCapsule_Destructor  # noqa: PLC0415
+
+    new_capsule = ctypes.pythonapi.PyCapsule_New
+    new_capsule.argtypes = [ctypes.c_void_p, ctypes.c_char_p, PyCapsule_Destructor]
+    new_capsule.restype = ctypes.py_object
+    capsule = new_capsule(stream.sycl_queue, b"SyclQueueRef", _queue_capsule_deleter)
+    _queue_capsule_refs[id(capsule)] = stream
+    return capsule
+
+
+def array_interface_to_desc(interface, device):
+    from warp._src.context import Stream  # noqa: PLC0415
+    from warp._src.dlpack import PyCapsule_GetPointer, PyCapsule_IsValid  # noqa: PLC0415
+
+    if interface.get("version") != 1:
+        raise ValueError("Unsupported SYCL USM array interface version")
+    if interface["data"][1]:
+        raise ValueError("Read-only SYCL USM arrays cannot be aliased by Warp")
+
+    syclobj = interface["syclobj"]
+    capsule = syclobj._get_capsule() if hasattr(syclobj, "_get_capsule") else syclobj
+    if not PyCapsule_IsValid(capsule, b"SyclQueueRef"):
+        raise TypeError("SYCL array interface requires a SyclQueueRef capsule or an object exposing one")
+    queue = PyCapsule_GetPointer(capsule, b"SyclQueueRef")
+    producer = Stream(device, sycl_queue=queue)
+
+    itemsize = np.dtype(interface["typestr"]).itemsize
+    pointer = interface["data"][0] + interface.get("offset", 0) * itemsize
+    if pointer:
+        check(device.runtime.sycl, device.runtime.sycl.wp_sycl_pointer_check(device.context, pointer))
+
+    device.stream.wait_stream(producer)
+
+    strides = interface.get("strides")
+    return {
+        "data": (pointer, False),
+        "shape": interface["shape"],
+        "strides": tuple(stride * itemsize for stride in strides) if strides is not None else None,
+        "typestr": interface["typestr"],
+    }
 
 
 def _resource_refs(value):

@@ -381,7 +381,7 @@ def spatial_helpers(test, device):
     assert_np_equal(out_np, np.zeros(9, dtype=np.float32), tol=1e-5)
 
 
-devices = get_test_devices()
+cpu_cuda_sycl_devices = get_test_devices(backends=("cpu", "cuda", "sycl"))
 
 
 class TestMath(unittest.TestCase):
@@ -462,20 +462,20 @@ class TestMath(unittest.TestCase):
         )
 
 
-add_function_test(TestMath, "test_scalar_math", test_scalar_math, devices=devices)
-add_function_test(TestMath, "test_erf_math", test_erf_math, devices=devices)
-add_function_test(TestMath, "test_vec_norm", test_vec_norm, devices=devices)
-add_function_test(TestMath, "test_smooth_normalize", test_smooth_normalize, devices=devices)
-add_function_test(TestMath, "test_quat_helpers", quat_helpers, devices=devices)
-add_function_test(TestMath, "test_quat_twist_angles", test_quat_twist_angles, devices=devices)
+add_function_test(TestMath, "test_scalar_math", test_scalar_math, devices=cpu_cuda_sycl_devices)
+add_function_test(TestMath, "test_erf_math", test_erf_math, devices=cpu_cuda_sycl_devices)
+add_function_test(TestMath, "test_vec_norm", test_vec_norm, devices=cpu_cuda_sycl_devices)
+add_function_test(TestMath, "test_smooth_normalize", test_smooth_normalize, devices=cpu_cuda_sycl_devices)
+add_function_test(TestMath, "test_quat_helpers", quat_helpers, devices=cpu_cuda_sycl_devices)
+add_function_test(TestMath, "test_quat_twist_angles", test_quat_twist_angles, devices=cpu_cuda_sycl_devices)
 add_function_test(
     TestMath,
     "test_quat_twist_angle_signed_branches",
     test_quat_twist_angle_signed_branches,
-    devices=devices,
+    devices=cpu_cuda_sycl_devices,
 )
-add_function_test(TestMath, "test_quat_euler_roundtrip", quat_euler_roundtrip, devices=devices)
-add_function_test(TestMath, "test_spatial_helpers", spatial_helpers, devices=devices)
+add_function_test(TestMath, "test_quat_euler_roundtrip", quat_euler_roundtrip, devices=cpu_cuda_sycl_devices)
+add_function_test(TestMath, "test_spatial_helpers", spatial_helpers, devices=cpu_cuda_sycl_devices)
 
 
 if __name__ == "__main__":

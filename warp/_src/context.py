@@ -6052,6 +6052,11 @@ class Device:
 
         # streams will be created when context is acquired
         self._stream = None
+        self._stream_provider = None
+        self._stream_provider_stream = None
+        self._stream_provider_saved = None
+        self._stream_provider_refreshing = False
+        self._stream_scope_depth = 0
         self.null_stream = None
 
         # maps streams to started graph captures
@@ -6292,6 +6297,8 @@ class Device:
     @property
     def context(self):
         """The context associated with the device."""
+        if self.is_sycl and self._stream_provider is not None and not self._stream_provider_refreshing:
+            _ = self.stream
         if self._context is not None:
             return self._context
         elif self.is_primary:
@@ -6320,6 +6327,22 @@ class Device:
             RuntimeError: The device is not a CUDA or SYCL device.
         """
         if (self.is_cuda and self.context) or self.is_sycl:
+            if (
+                self._stream_provider is not None
+                and self._stream is self._stream_provider_stream
+                and not self._stream_provider_refreshing
+                and self._stream_scope_depth == 0
+            ):
+                self._stream_provider_refreshing = True
+                try:
+                    stream = self._stream_provider()
+                    if stream is not self._stream:
+                        if self.captures:
+                            raise RuntimeError("Cannot change the shared Torch queue during graph capture")
+                        self.set_stream(stream, sync=True)
+                        self._stream_provider_stream = stream
+                finally:
+                    self._stream_provider_refreshing = False
             return self._stream
         else:
             raise RuntimeError(f"Device {self} is not a CUDA device")
@@ -14945,7 +14968,9 @@ def copy(
                 if not src.is_contiguous:
                     src = src.contiguous()
                 if not dest.is_contiguous:
-                    staging = empty(shape=dest.shape, dtype=dest.dtype, device=dest.device)
+                    staging = empty(
+                        shape=dest.shape, dtype=dest.dtype, device=dest.device, requires_grad=src.requires_grad
+                    )
                     copy(staging, src, dest_offset, src_offset, count)
                     copy(dest, staging, dest_offset, dest_offset, count)
                     return
@@ -14963,6 +14988,7 @@ def copy(
                     src_size,
                 ),
             )
+            _copy_gradients(dest, src, dest_offset, src_offset, count, stream)
             return
         check(
             runtime.sycl,
@@ -14974,6 +15000,7 @@ def copy(
                 int(src.device.is_cpu or dest.device.is_cpu),
             ),
         )
+        _copy_gradients(dest, src, dest_offset, src_offset, count, stream)
         return
 
     if stream is None:
@@ -15220,7 +15247,17 @@ def copy(
         if not result:
             raise RuntimeError(f"Warp copy error: {runtime.get_error_string()}")
 
-    # copy gradient, if needed
+    _copy_gradients(dest, src, dest_offset, src_offset, count, stream)
+
+
+def _copy_gradients(
+    dest: warp.array,
+    src: warp.array,
+    dest_offset: int,
+    src_offset: int,
+    count: int,
+    stream: Stream | None,
+):
     if hasattr(src, "grad") and src.grad is not None and hasattr(dest, "grad") and dest.grad is not None:
         copy(dest.grad, src.grad, dest_offset=dest_offset, src_offset=src_offset, count=count, stream=stream)
 

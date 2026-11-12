@@ -269,7 +269,14 @@ def build_sycl(output: str, source: str, options: dict) -> None:
         command.append("-ffast-math")
     else:
         # icpx defaults to a fast floating-point model with approximate sin/cos/tan, sqrt and division
-        command.extend(["-ffp-model=precise", "-foffload-fp32-prec-sqrt", "-foffload-fp32-prec-div"])
+        command.extend(
+            [
+                "-ffp-model=precise",
+                "-fno-math-errno",
+                "-foffload-fp32-prec-sqrt",
+                "-foffload-fp32-prec-div",
+            ]
+        )
     if not options["fuse_fp"]:
         command.append("-ffp-contract=off")
     run_sycl_compiler(command)

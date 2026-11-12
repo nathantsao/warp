@@ -3455,9 +3455,6 @@ class array(Array[DType, NDim]):
             self._retain_grad = True
 
     def _init_from_data(self, data, dtype, shape, device, copy, pinned):
-        if not hasattr(data, "__len__"):
-            raise RuntimeError(f"Data must be a sequence or array, got scalar {data}")
-
         if hasattr(dtype, "_wp_scalar_type_"):
             dtype_shape = dtype._shape_
             dtype_ndim = len(dtype_shape)
@@ -3475,8 +3472,15 @@ class array(Array[DType, NDim]):
             # which takes take of initializing Warp if needed.
             device = warp._src.context.get_device(device)
 
+        desc = None
         if device.is_cuda and hasattr(data, "__cuda_array_interface__"):
             desc = data.__cuda_array_interface__
+        elif device.is_sycl and hasattr(data, "__sycl_usm_array_interface__"):
+            from warp._src.sycl import array_interface_to_desc  # noqa: PLC0415
+
+            desc = array_interface_to_desc(data.__sycl_usm_array_interface__, device)
+
+        if desc is not None:
             data_shape = desc.get("shape")
             data_strides = desc.get("strides")
             data_dtype_np = np.dtype(desc.get("typestr"))
@@ -3610,6 +3614,9 @@ class array(Array[DType, NDim]):
             # keep a ref to the source data to keep allocation alive
             self._ref = data
             return
+
+        if not hasattr(data, "__len__"):
+            raise RuntimeError(f"Data must be a sequence or array, got scalar {data}")
 
         # convert input data to ndarray (handles lists, tuples, etc.) and determine dtype
         if dtype is Any:
@@ -4058,6 +4065,39 @@ class array(Array[DType, NDim]):
             }
 
         return self._array_interface
+
+    @property
+    def __sycl_usm_array_interface__(self):
+        if self.device is None or not self.device.is_sycl:
+            raise AttributeError(f"__sycl_usm_array_interface__ is not supported because device is {self.device}")
+
+        from warp._src.sycl import queue_to_capsule  # noqa: PLC0415
+
+        if self._array_interface is None:
+            typestr = type_typestr(self.dtype)
+            itemsize = np.dtype(typestr).itemsize
+            if np.dtype(typestr).kind not in "biufc":
+                raise AttributeError("SYCL USM array interface requires a numeric or boolean dtype")
+            if issubclass(self.dtype, ctypes.Array):
+                arr_shape = (*self.shape, *self.dtype._shape_)
+                dtype_strides = strides_from_shape(self.dtype._shape_, self.dtype._type_)
+                arr_strides = (*self.strides, *dtype_strides)
+            else:
+                arr_shape = self.shape
+                arr_strides = self.strides
+
+            if any(stride % itemsize for stride in arr_strides):
+                raise AttributeError("SYCL USM array interface requires element-aligned strides")
+            self._array_interface = {
+                "data": (self.ptr if self.ptr is not None else 0, False),
+                "shape": tuple(arr_shape),
+                "strides": tuple(stride // itemsize for stride in arr_strides),
+                "typestr": typestr,
+                "offset": 0,
+                "version": 1,
+            }
+
+        return {**self._array_interface, "syclobj": queue_to_capsule(self.device.stream)}
 
     def __dlpack__(self, stream=None, *, max_version=None, dl_device=None, copy=None):
         # See https://data-apis.org/array-api/2022.12/API_specification/generated/array_api.array.__dlpack__.html

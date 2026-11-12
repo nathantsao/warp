@@ -1047,7 +1047,7 @@ def tile_bvh_query_valid_ray_kernel(
             wp.atomic_add(bounds_intersected, result_idx, 1)
 
 
-devices = get_test_devices()
+cpu_cuda_sycl_devices = get_test_devices(backends=("cpu", "cuda", "sycl"))
 cuda_devices = get_cuda_test_devices()
 cuda_devices_with_mempool = get_cuda_test_devices_with_mempool()
 
@@ -1087,26 +1087,28 @@ class TestBvh(unittest.TestCase):
             wp.Bvh(lowers, uppers, constructor="cubql", groups=groups)
 
 
-add_function_test(TestBvh, "test_bvh_aabb", test_bvh_query_aabb, devices=devices)
-add_function_test(TestBvh, "test_bvh_ray", test_bvh_query_ray, devices=devices)
-add_function_test(TestBvh, "test_bvh_sphere", test_bvh_query_sphere, devices=devices)
-add_function_test(TestBvh, "test_bvh_capsule", test_bvh_query_capsule, devices=devices)
-add_function_test(TestBvh, "test_bvh_cubql_constructor", test_bvh_cubql_constructor, devices=devices)
-add_function_test(TestBvh, "test_bvh_query_runtime_kind", test_bvh_query_runtime_kind, devices=devices)
-add_function_test(TestBvh, "test_bvh_query_erased_func_param", test_bvh_query_erased_func_param, devices=devices)
+add_function_test(TestBvh, "test_bvh_aabb", test_bvh_query_aabb, devices=cpu_cuda_sycl_devices)
+add_function_test(TestBvh, "test_bvh_ray", test_bvh_query_ray, devices=cpu_cuda_sycl_devices)
+add_function_test(TestBvh, "test_bvh_sphere", test_bvh_query_sphere, devices=cpu_cuda_sycl_devices)
+add_function_test(TestBvh, "test_bvh_capsule", test_bvh_query_capsule, devices=cpu_cuda_sycl_devices)
+add_function_test(TestBvh, "test_bvh_cubql_constructor", test_bvh_cubql_constructor, devices=cpu_cuda_sycl_devices)
+add_function_test(TestBvh, "test_bvh_query_runtime_kind", test_bvh_query_runtime_kind, devices=cpu_cuda_sycl_devices)
+add_function_test(
+    TestBvh, "test_bvh_query_erased_func_param", test_bvh_query_erased_func_param, devices=cpu_cuda_sycl_devices
+)
 add_function_test(
     TestBvh,
     "test_bvh_ray_query_inside_and_outside_bounds",
     test_bvh_ray_query_inside_and_outside_bounds,
-    devices=devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(TestBvh, "test_bvh_refit_root_leaves", test_bvh_refit_root_leaves, devices=cuda_devices)
-add_function_test(TestBvh, "test_tile_bvh_query_aabb", test_tile_bvh_query, devices=devices)
-add_function_test(TestBvh, "test_tile_bvh_query_ray", test_tile_bvh_query_ray, devices=devices)
+add_function_test(TestBvh, "test_tile_bvh_query_aabb", test_tile_bvh_query, devices=cpu_cuda_sycl_devices)
+add_function_test(TestBvh, "test_tile_bvh_query_ray", test_tile_bvh_query_ray, devices=cpu_cuda_sycl_devices)
 
 # Compatibility tests for the deprecated bvh_query_*_tiled() aliases.
-add_function_test(TestBvh, "test_bvh_query_aabb_tiled", test_bvh_query_aabb_tiled, devices=devices)
-add_function_test(TestBvh, "test_bvh_query_ray_tiled", test_bvh_query_ray_tiled, devices=devices)
+add_function_test(TestBvh, "test_bvh_query_aabb_tiled", test_bvh_query_aabb_tiled, devices=cpu_cuda_sycl_devices)
+add_function_test(TestBvh, "test_bvh_query_ray_tiled", test_bvh_query_ray_tiled, devices=cpu_cuda_sycl_devices)
 
 for name, func in (
     ("test_tile_bvh_query_aabb", test_tile_bvh_query),
@@ -1121,7 +1123,7 @@ for name, func in (
         devices=["cpu"] if wp.is_cpu_available() else [],
         enable_cpu_blocks=True,
     )
-
+# TODO: add sycl support
 add_function_test(TestBvh, "test_capture_bvh_rebuild", test_capture_bvh_rebuild, devices=cuda_devices_with_mempool)
 
 if __name__ == "__main__":

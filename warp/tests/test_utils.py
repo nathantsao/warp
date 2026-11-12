@@ -1118,6 +1118,8 @@ def parenthesized_multiline_lambda():
 
 devices = get_test_devices()
 cuda_devices = get_cuda_test_devices()
+cpu_cuda_sycl_devices = get_test_devices(backends=("cpu", "cuda", "sycl"))
+cuda_sycl_devices = get_test_devices(backends=("cuda", "sycl"))
 
 
 class TestUtils(unittest.TestCase):
@@ -1361,10 +1363,12 @@ class TestUtils(unittest.TestCase):
         self.assertGreaterEqual(result.elapsed, 0.0)
 
 
-add_function_test(TestUtils, "test_array_scan", test_array_scan, devices=devices)
-add_function_test(TestUtils, "test_array_scan_vector", test_array_scan_vector, devices=devices)
-add_function_test(TestUtils, "test_array_scan_strided_views", test_array_scan_strided_views, devices=devices)
-add_function_test(TestUtils, "test_array_scan_empty", test_array_scan_empty, devices=devices)
+add_function_test(TestUtils, "test_array_scan", test_array_scan, devices=cpu_cuda_sycl_devices)
+add_function_test(TestUtils, "test_array_scan_vector", test_array_scan_vector, devices=cpu_cuda_sycl_devices)
+add_function_test(
+    TestUtils, "test_array_scan_strided_views", test_array_scan_strided_views, devices=cpu_cuda_sycl_devices
+)
+add_function_test(TestUtils, "test_array_scan_empty", test_array_scan_empty, devices=cpu_cuda_sycl_devices)
 add_function_test(
     TestUtils, "test_array_scan_error_sizes_mismatch", test_array_scan_error_sizes_mismatch, devices=devices
 )
@@ -1372,21 +1376,25 @@ add_function_test(
     TestUtils, "test_array_scan_error_dtypes_mismatch", test_array_scan_error_dtypes_mismatch, devices=devices
 )
 add_function_test(
-    TestUtils, "test_array_scan_error_unsupported_dtype", test_array_scan_error_unsupported_dtype, devices=devices
+    TestUtils,
+    "test_array_scan_error_unsupported_dtype",
+    test_array_scan_error_unsupported_dtype,
+    devices=cpu_cuda_sycl_devices,
 )
-add_function_test(TestUtils, "test_radix_sort_pairs", test_radix_sort_pairs, devices=devices)
+add_function_test(TestUtils, "test_radix_sort_pairs", test_radix_sort_pairs, devices=cpu_cuda_sycl_devices)
 add_function_test(
     TestUtils,
     "test_radix_sort_pairs_graph_capture",
     test_radix_sort_pairs_graph_capture,
-    devices=get_selected_cuda_test_devices(),
+    devices=cuda_sycl_devices,
 )
 add_function_test(
     TestUtils,
     "test_radix_sort_pairs_graph_capture_independent_graphs",
     test_radix_sort_pairs_graph_capture_independent_graphs,
-    devices=get_selected_cuda_test_devices(),
+    devices=cuda_sycl_devices,
 )
+# TODO: add sycl support
 add_function_test(
     TestUtils,
     "test_radix_sort_pairs_capture_if_forked_stream",
@@ -1421,52 +1429,63 @@ add_function_test(
     TestUtils,
     "test_segmented_sort_pairs_graph_capture",
     test_segmented_sort_pairs_graph_capture,
-    devices=get_selected_cuda_test_devices(),
+    devices=cuda_sycl_devices,
 )
-add_function_test(TestUtils, "test_radix_sort_pairs_signed_keys", test_radix_sort_pairs_signed_keys, devices=devices)
-add_function_test(TestUtils, "test_radix_sort_pairs_bit_range", test_radix_sort_pairs_bit_range, devices=devices)
-add_function_test(TestUtils, "test_radix_sort_pairs_value_types", test_radix_sort_pairs_value_types, devices=devices)
+add_function_test(
+    TestUtils, "test_radix_sort_pairs_signed_keys", test_radix_sort_pairs_signed_keys, devices=cpu_cuda_sycl_devices
+)
+add_function_test(
+    TestUtils, "test_radix_sort_pairs_bit_range", test_radix_sort_pairs_bit_range, devices=cpu_cuda_sycl_devices
+)
+add_function_test(
+    TestUtils, "test_radix_sort_pairs_value_types", test_radix_sort_pairs_value_types, devices=cpu_cuda_sycl_devices
+)
 add_function_test(
     TestUtils,
     "test_radix_sort_pairs_64_bit_keys_8_byte_values",
     test_radix_sort_pairs_64_bit_keys_8_byte_values,
-    devices=devices,
+    devices=cpu_cuda_sycl_devices,
 )
-add_function_test(TestUtils, "test_radix_sort_pairs_empty", test_radix_sort_pairs_empty, devices=devices)
+add_function_test(TestUtils, "test_radix_sort_pairs_empty", test_radix_sort_pairs_empty, devices=cpu_cuda_sycl_devices)
 add_function_test(
     TestUtils,
     "test_radix_sort_pairs_error_insufficient_storage",
     test_radix_sort_pairs_error_insufficient_storage,
-    devices=devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestUtils,
     "test_radix_sort_pairs_error_unsupported_dtype",
     test_radix_sort_pairs_error_unsupported_dtype,
-    devices=devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestUtils,
     "test_radix_sort_pairs_error_invalid_bit_range",
     test_radix_sort_pairs_error_invalid_bit_range,
-    devices=devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestUtils,
     "test_radix_sort_pairs_error_non_contiguous",
     test_radix_sort_pairs_error_non_contiguous,
-    devices=devices,
+    devices=cpu_cuda_sycl_devices,
 )
-add_function_test(TestUtils, "test_segmented_sort_pairs", test_segmented_sort_pairs, devices=devices)
-add_function_test(TestUtils, "test_segmented_sort_pairs_empty", test_segmented_sort_pairs_empty, devices=devices)
+add_function_test(TestUtils, "test_segmented_sort_pairs", test_segmented_sort_pairs, devices=cpu_cuda_sycl_devices)
 add_function_test(
-    TestUtils, "test_segmented_sort_pairs_no_segments", test_segmented_sort_pairs_no_segments, devices=devices
+    TestUtils, "test_segmented_sort_pairs_empty", test_segmented_sort_pairs_empty, devices=cpu_cuda_sycl_devices
+)
+add_function_test(
+    TestUtils,
+    "test_segmented_sort_pairs_no_segments",
+    test_segmented_sort_pairs_no_segments,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestUtils,
     "test_segmented_sort_pairs_error_insufficient_storage",
     test_segmented_sort_pairs_error_insufficient_storage,
-    devices=devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestUtils,
@@ -1502,7 +1521,7 @@ add_function_test(
     TestUtils,
     "test_segmented_sort_pairs_error_non_contiguous",
     test_segmented_sort_pairs_error_non_contiguous,
-    devices=devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(
     TestUtils,
@@ -1520,7 +1539,7 @@ add_function_test(
     TestUtils,
     "test_segmented_sort_pairs_error_unsupported_dtype",
     test_segmented_sort_pairs_error_unsupported_dtype,
-    devices=devices,
+    devices=cpu_cuda_sycl_devices,
 )
 add_function_test(TestUtils, "test_array_sum", test_array_sum, devices=devices)
 add_function_test(

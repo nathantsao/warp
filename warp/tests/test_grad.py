@@ -838,7 +838,7 @@ def test_gradient_slice_3d_2d(test, device):
         assert_np_equal(a.grad.numpy(), np.array(expected_grad))
 
 
-devices = get_test_devices()
+cpu_cuda_sycl_devices = get_test_devices(backends=("cpu", "cuda", "sycl"))
 
 
 class TestGrad(unittest.TestCase):
@@ -846,29 +846,36 @@ class TestGrad(unittest.TestCase):
 
 
 # add_function_test(TestGrad, "test_while_loop_grad", test_while_loop_grad, devices=devices)
-add_function_test(TestGrad, "test_for_loop_nested_for_grad", test_for_loop_nested_for_grad, devices=devices)
-add_function_test(TestGrad, "test_scalar_grad", test_scalar_grad, devices=devices)
-add_function_test(TestGrad, "test_for_loop_grad", test_for_loop_grad, devices=devices)
+add_function_test(
+    TestGrad, "test_for_loop_nested_for_grad", test_for_loop_nested_for_grad, devices=cpu_cuda_sycl_devices
+)
+add_function_test(TestGrad, "test_scalar_grad", test_scalar_grad, devices=cpu_cuda_sycl_devices)
+add_function_test(TestGrad, "test_for_loop_grad", test_for_loop_grad, devices=cpu_cuda_sycl_devices)
+# TODO: add sycl support
 add_function_test(
     TestGrad, "test_for_loop_graph_grad", test_for_loop_graph_grad, devices=get_selected_cuda_test_devices()
 )
-add_function_test(TestGrad, "test_for_loop_nested_if_grad", test_for_loop_nested_if_grad, devices=devices)
-add_function_test(TestGrad, "test_preserve_outputs_grad", test_preserve_outputs_grad, devices=devices)
-add_function_test(TestGrad, "test_vector_math_grad", test_vector_math_grad, devices=devices)
-add_function_test(TestGrad, "test_matrix_math_grad", test_matrix_math_grad, devices=devices)
-add_function_test(TestGrad, "test_3d_math_grad", test_3d_math_grad, devices=devices)
-add_function_test(TestGrad, "test_multi_valued_function_grad", test_multi_valued_function_grad, devices=devices)
-add_function_test(TestGrad, "test_mesh_grad", test_mesh_grad, devices=devices)
-add_function_test(TestGrad, "test_name_clash", test_name_clash, devices=devices)
-add_function_test(TestGrad, "test_struct_attribute_gradient", test_struct_attribute_gradient, devices=devices)
-add_function_test(TestGrad, "test_copy", test_copy, devices=devices)
-add_function_test(TestGrad, "test_aliasing", test_aliasing, devices=devices)
-add_function_test(TestGrad, "test_gradient_internal", test_gradient_internal, devices=devices)
-add_function_test(TestGrad, "test_gradient_external", test_gradient_external, devices=devices)
-add_function_test(TestGrad, "test_gradient_precedence", test_gradient_precedence, devices=devices)
-add_function_test(TestGrad, "test_gradient_slice_2d", test_gradient_slice_2d, devices=devices)
-add_function_test(TestGrad, "test_gradient_slice_3d_1d", test_gradient_slice_3d_1d, devices=devices)
-add_function_test(TestGrad, "test_gradient_slice_3d_2d", test_gradient_slice_3d_2d, devices=devices)
+add_function_test(TestGrad, "test_for_loop_nested_if_grad", test_for_loop_nested_if_grad, devices=cpu_cuda_sycl_devices)
+add_function_test(TestGrad, "test_preserve_outputs_grad", test_preserve_outputs_grad, devices=cpu_cuda_sycl_devices)
+add_function_test(TestGrad, "test_vector_math_grad", test_vector_math_grad, devices=cpu_cuda_sycl_devices)
+add_function_test(TestGrad, "test_matrix_math_grad", test_matrix_math_grad, devices=cpu_cuda_sycl_devices)
+add_function_test(TestGrad, "test_3d_math_grad", test_3d_math_grad, devices=cpu_cuda_sycl_devices)
+add_function_test(
+    TestGrad, "test_multi_valued_function_grad", test_multi_valued_function_grad, devices=cpu_cuda_sycl_devices
+)
+add_function_test(TestGrad, "test_mesh_grad", test_mesh_grad, devices=cpu_cuda_sycl_devices)
+add_function_test(TestGrad, "test_name_clash", test_name_clash, devices=cpu_cuda_sycl_devices)
+add_function_test(
+    TestGrad, "test_struct_attribute_gradient", test_struct_attribute_gradient, devices=cpu_cuda_sycl_devices
+)
+add_function_test(TestGrad, "test_copy", test_copy, devices=cpu_cuda_sycl_devices)
+add_function_test(TestGrad, "test_aliasing", test_aliasing, devices=cpu_cuda_sycl_devices)
+add_function_test(TestGrad, "test_gradient_internal", test_gradient_internal, devices=cpu_cuda_sycl_devices)
+add_function_test(TestGrad, "test_gradient_external", test_gradient_external, devices=cpu_cuda_sycl_devices)
+add_function_test(TestGrad, "test_gradient_precedence", test_gradient_precedence, devices=cpu_cuda_sycl_devices)
+add_function_test(TestGrad, "test_gradient_slice_2d", test_gradient_slice_2d, devices=cpu_cuda_sycl_devices)
+add_function_test(TestGrad, "test_gradient_slice_3d_1d", test_gradient_slice_3d_1d, devices=cpu_cuda_sycl_devices)
+add_function_test(TestGrad, "test_gradient_slice_3d_2d", test_gradient_slice_3d_2d, devices=cpu_cuda_sycl_devices)
 
 
 if __name__ == "__main__":

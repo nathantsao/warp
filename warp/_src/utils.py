@@ -1694,13 +1694,19 @@ class ScopedStream:
             self.device_scope.__enter__()
             self.saved_stream = self.device.stream
             self.device.set_stream(self.stream, self.sync_enter)
+            if self.device.is_sycl:
+                self.device._stream_scope_depth += 1
 
         return self.stream
 
     def __exit__(self, exc_type, exc_value, traceback):
         if self.stream is not None:
-            self.device.set_stream(self.saved_stream, self.sync_exit)
-            self.device_scope.__exit__(exc_type, exc_value, traceback)
+            try:
+                self.device.set_stream(self.saved_stream, self.sync_exit)
+            finally:
+                if self.device.is_sycl:
+                    self.device._stream_scope_depth -= 1
+                self.device_scope.__exit__(exc_type, exc_value, traceback)
 
 
 TIMING_KERNEL = 1

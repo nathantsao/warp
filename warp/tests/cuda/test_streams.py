@@ -520,11 +520,12 @@ def test_stream_synchronize_cpu(test, _):
 
 def test_synchronize_during_capture(test, device):
     with wp.ScopedDevice(device):
-        with test.assertRaisesRegex(RuntimeError, "Cannot synchronize device"):
+        device_error = "Cannot synchronize during SYCL graph capture" if device.is_sycl else "Cannot synchronize device"
+        with test.assertRaisesRegex(RuntimeError, device_error):
             with wp.ScopedCapture():
                 wp.synchronize()
 
-        with test.assertRaisesRegex(RuntimeError, "Cannot synchronize device"):
+        with test.assertRaisesRegex(RuntimeError, device_error):
             with wp.ScopedCapture():
                 wp.synchronize_device()
 
@@ -538,10 +539,25 @@ def test_synchronize_during_capture(test, device):
                 wp.synchronize_event(e)
 
 
-devices = get_selected_cuda_test_devices()
+cuda_devices = get_selected_cuda_test_devices()
+cuda_sycl_devices = get_test_devices(backends=("cuda", "sycl"))
 
 
 class TestStreams(unittest.TestCase):
+    """Test stream behavior using the same functions on supported GPU backends.
+
+    Known CUDA parity gaps, skipped only for SYCL:
+
+    =================================  ================================================
+    Test                               Requirement for removing the SYCL skip
+    =================================  ================================================
+    test_stream_arg_explicit_sync      Support wp.copy(..., stream=...) on SYCL.
+    test_stream_scope_implicit_sync    Provide CUDA-compatible legacy null-stream ordering
+                                       for host reads after leaving a stream scope.
+    test_event_external               Support external waits between captured SYCL graphs.
+    =================================  ================================================
+    """
+
     def test_stream_exceptions(self):
         cpu_device = wp.get_device("cpu")
 
@@ -698,30 +714,102 @@ def test_stream_is_blocking(test, device):
     test.assertTrue(wrapped._is_blocking)  # now cached
 
 
-add_function_test(TestStreams, "test_stream_set", test_stream_set, devices=devices)
-add_function_test(TestStreams, "test_stream_arg_explicit_sync", test_stream_arg_explicit_sync, devices=devices)
-add_function_test(TestStreams, "test_stream_scope_implicit_sync", test_stream_scope_implicit_sync, devices=devices)
+def _check_explicit_stream_copy(test, device):
+    if device.is_sycl:
+        test.skipTest("Missing CUDA parity: SYCL does not support wp.copy(..., stream=...).")
 
-add_function_test(TestStreams, "test_stream_arg_synchronize", test_stream_arg_synchronize, devices=devices)
-add_function_test(TestStreams, "test_stream_arg_wait_event", test_stream_arg_wait_event, devices=devices)
-add_function_test(TestStreams, "test_stream_arg_wait_stream", test_stream_arg_wait_stream, devices=devices)
-add_function_test(TestStreams, "test_stream_scope_synchronize", test_stream_scope_synchronize, devices=devices)
-add_function_test(TestStreams, "test_stream_scope_wait_event", test_stream_scope_wait_event, devices=devices)
-add_function_test(TestStreams, "test_stream_scope_wait_stream", test_stream_scope_wait_stream, devices=devices)
-add_function_test(TestStreams, "test_stream_priority_basics", test_stream_priority_basics, devices=devices)
-add_function_test(TestStreams, "test_stream_priority_timings", test_stream_priority_timings, devices=devices)
-add_function_test(TestStreams, "test_stream_event_is_complete", test_stream_event_is_complete, devices=devices)
 
-add_function_test(TestStreams, "test_event_synchronize", test_event_synchronize, devices=devices)
-add_function_test(TestStreams, "test_event_elapsed_time", test_event_elapsed_time, devices=devices)
-add_function_test(TestStreams, "test_event_elapsed_time_graph", test_event_elapsed_time_graph, devices=devices)
-add_function_test(TestStreams, "test_event_external", test_event_external, devices=devices)
+def _check_implicit_stream_ordering(test, device):
+    if device.is_sycl:
+        test.skipTest("Missing CUDA parity: SYCL does not provide CUDA legacy null-stream ordering.")
 
-add_function_test(TestStreams, "test_graph_destroy_during_capture", test_graph_destroy_during_capture, devices=devices)
+
+def _check_graph_capture(test, device):
+    if not device.supports_graph_capture:
+        test.skipTest("Device does not support graph capture.")
+
+
+def _check_captured_events(test, device):
+    _check_graph_capture(test, device)
+    if not device.is_graph_capture_event_supported:
+        test.skipTest("Device does not support captured event timing.")
+
+
+def _check_external_events(test, device):
+    _check_graph_capture(test, device)
+    if device.is_sycl:
+        test.skipTest("Missing CUDA parity: external event waits between SYCL graphs are not supported.")
+
+
+add_function_test(TestStreams, "test_stream_set", test_stream_set, devices=cuda_sycl_devices)
+add_function_test(
+    TestStreams,
+    "test_stream_arg_explicit_sync",
+    test_stream_arg_explicit_sync,
+    devices=cuda_sycl_devices,
+    device_check=_check_explicit_stream_copy,
+)
+add_function_test(
+    TestStreams,
+    "test_stream_scope_implicit_sync",
+    test_stream_scope_implicit_sync,
+    devices=cuda_sycl_devices,
+    device_check=_check_implicit_stream_ordering,
+)
+
+add_function_test(TestStreams, "test_stream_arg_synchronize", test_stream_arg_synchronize, devices=cuda_sycl_devices)
+add_function_test(TestStreams, "test_stream_arg_wait_event", test_stream_arg_wait_event, devices=cuda_sycl_devices)
+add_function_test(TestStreams, "test_stream_arg_wait_stream", test_stream_arg_wait_stream, devices=cuda_sycl_devices)
+add_function_test(
+    TestStreams, "test_stream_scope_synchronize", test_stream_scope_synchronize, devices=cuda_sycl_devices
+)
+add_function_test(TestStreams, "test_stream_scope_wait_event", test_stream_scope_wait_event, devices=cuda_sycl_devices)
+add_function_test(
+    TestStreams, "test_stream_scope_wait_stream", test_stream_scope_wait_stream, devices=cuda_sycl_devices
+)
+add_function_test(TestStreams, "test_stream_priority_basics", test_stream_priority_basics, devices=cuda_devices)
+add_function_test(TestStreams, "test_stream_priority_timings", test_stream_priority_timings, devices=cuda_devices)
+add_function_test(
+    TestStreams,
+    "test_stream_event_is_complete",
+    test_stream_event_is_complete,
+    devices=cuda_sycl_devices,
+)
+
+add_function_test(TestStreams, "test_event_synchronize", test_event_synchronize, devices=cuda_sycl_devices)
+add_function_test(TestStreams, "test_event_elapsed_time", test_event_elapsed_time, devices=cuda_sycl_devices)
+add_function_test(
+    TestStreams,
+    "test_event_elapsed_time_graph",
+    test_event_elapsed_time_graph,
+    devices=cuda_sycl_devices,
+    device_check=_check_captured_events,
+)
+add_function_test(
+    TestStreams,
+    "test_event_external",
+    test_event_external,
+    devices=cuda_sycl_devices,
+    device_check=_check_external_events,
+)
+
+add_function_test(
+    TestStreams,
+    "test_graph_destroy_during_capture",
+    test_graph_destroy_during_capture,
+    devices=cuda_sycl_devices,
+    device_check=_check_graph_capture,
+)
 
 add_function_test(TestStreams, "test_stream_synchronize_cpu", test_stream_synchronize_cpu, devices=None)
-add_function_test(TestStreams, "test_synchronize_during_capture", test_synchronize_during_capture, devices=devices)
-add_function_test(TestStreams, "test_stream_is_blocking", test_stream_is_blocking, devices=devices)
+add_function_test(
+    TestStreams,
+    "test_synchronize_during_capture",
+    test_synchronize_during_capture,
+    devices=cuda_sycl_devices,
+    device_check=_check_graph_capture,
+)
+add_function_test(TestStreams, "test_stream_is_blocking", test_stream_is_blocking, devices=cuda_devices)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

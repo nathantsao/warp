@@ -243,6 +243,7 @@ from warp._src.torch import dtype_to_torch as dtype_to_torch
 from warp._src.torch import device_from_torch as device_from_torch
 from warp._src.torch import device_to_torch as device_to_torch
 from warp._src.torch import stream_from_torch as stream_from_torch
+from warp._src.torch import set_torch_stream_enabled as set_torch_stream_enabled
 from warp._src.torch import stream_to_torch as stream_to_torch
 from warp._src.fabric import fabricarray as fabricarray
 from warp._src.fabric import fabricarrayarray as fabricarrayarray
