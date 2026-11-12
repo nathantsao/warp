@@ -2255,6 +2255,7 @@ class Adjoint:
         # SYCL tile operations reuse transient workspace outside the callee frames.
         adj.max_required_sycl_tile_scratch = 0
         adj.uses_sycl_tile_sort = False
+        adj.uses_sycl_print = False
 
         # recorded at call sites for ModuleBuilder's post-build propagation passes
         adj.called_user_functions = {}
@@ -2999,6 +3000,12 @@ class Adjoint:
         # for example by checking whether an argument corresponds to
         # a literal value or references a variable.
         extra_shared_memory = 0
+        if (
+            adj.builder_options.get("target_backend") == "sycl"
+            and func.is_builtin()
+            and func.key in ("print", "printf")
+        ):
+            adj.uses_sycl_print = True
         if adj.builder_options.get("target_backend") == "sycl" and func.is_builtin() and func.key == "tile_sort":
             adj.uses_sycl_tile_sort = True
             keys = strip_reference(bound_arg_types["keys"])
@@ -8608,6 +8615,7 @@ def codegen_sycl_module(kernel, options):
     visited = set()
     uses_tiles = False
     uses_tile_sort = False
+    uses_print = False
     while pending:
         function_adj = pending.pop()
         if function_adj in visited:
@@ -8615,6 +8623,7 @@ def codegen_sycl_module(kernel, options):
         visited.add(function_adj)
         uses_tiles |= any(is_tile(var.type) or is_tile_stack(var.type) for var in function_adj.variables)
         uses_tile_sort |= function_adj.uses_sycl_tile_sort
+        uses_print |= function_adj.uses_sycl_print
         pending.extend(function.adj for function in function_adj.called_user_functions)
     name = kernel.get_mangled_name()
     tile_init = "                wp::tile_shared_storage_t tile_storage;\n" if uses_tiles else ""
@@ -8705,6 +8714,7 @@ extern "C" WP_API int {name}_sycl_{direction}(
         if (dim.size == 0)
             return;
 {tile_sort_validate}
+{"        wp::SyclPrintfScope printf_scope(device);" if uses_print else ""}
         constexpr bool staged =
             sizeof(dim) + sizeof(wp_args_{name}){adj_size} + 64 > WP_SYCL_MAX_KERNEL_ARG_BYTES;
         {name}_sycl_submit_{direction}<staged>(device, dim, args{", adj_args" if backward else ""});

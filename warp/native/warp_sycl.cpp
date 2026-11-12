@@ -81,6 +81,8 @@ struct SyclGraph {
     ze_command_list_handle_t native_list;
     std::unique_ptr<experimental::command_graph<experimental::graph_state::modifiable>> recording;
     std::vector<std::shared_ptr<Executable>> segments;
+    std::vector<bool> printing_segments;
+    bool printing_segment = false;
     std::vector<void*> allocations;
     std::vector<void*> staged;
     std::vector<SyclGraphEvent> events;
@@ -94,15 +96,16 @@ struct SyclGraph {
     {
     }
 
-    void begin_segment()
+    void begin_segment(bool native = true)
     {
         auto segment = std::make_unique<experimental::command_graph<experimental::graph_state::modifiable>>(
             queue.get_context(), queue.get_device(),
-            native_list ? sycl::property_list { experimental::property::graph::enable_native_recording {} }
-                        : sycl::property_list {}
+            native_list && native ? sycl::property_list { experimental::property::graph::enable_native_recording {} }
+                                  : sycl::property_list {}
         );
         segment->begin_recording(queue);
         recording = std::move(segment);
+        printing_segment = !native;
     }
 
     void finish_segment()
@@ -110,6 +113,7 @@ struct SyclGraph {
         recording->end_recording(queue);
         auto segment = std::move(recording);
         segments.push_back(std::make_shared<Executable>(segment->finalize()));
+        printing_segments.push_back(printing_segment);
     }
 
     void retain_staged(void* ptr)
@@ -1083,6 +1087,30 @@ int wp_sycl_graph_end(void* device, void* handle)
     });
 }
 
+int wp_sycl_printf_begin(void* device)
+{
+    bool segmented = false;
+    const int result = wp::sycl_checked([&] {
+        auto* graph = get_device(device).capture;
+        if (graph && graph->native_list) {
+            // Native recording delays device printf until teardown; ordinary segments flush on replay completion.
+            graph->finish_segment();
+            graph->begin_segment(false);
+            segmented = true;
+        }
+    });
+    return result < 0 ? result : int(segmented);
+}
+
+int wp_sycl_printf_end(void* device)
+{
+    return wp::sycl_checked([&] {
+        auto& graph = *get_device(device).capture;
+        graph.finish_segment();
+        graph.begin_segment();
+    });
+}
+
 int wp_sycl_graph_launch(void* device, void* handle)
 {
     return wp::sycl_checked([&] {
@@ -1096,6 +1124,9 @@ int wp_sycl_graph_launch(void* device, void* handle)
                 // Native graph launches are not captured by all drivers. Retain ordered GPU segments instead.
                 parent.finish_segment();
                 parent.segments.insert(parent.segments.end(), graph.segments.begin(), graph.segments.end());
+                parent.printing_segments.insert(
+                    parent.printing_segments.end(), graph.printing_segments.begin(), graph.printing_segments.end()
+                );
                 parent.begin_segment();
             } else {
                 if (graph.native_list)
@@ -1112,12 +1143,16 @@ int wp_sycl_graph_launch(void* device, void* handle)
                         == dependencies.end())
                     dependencies.push_back(marker.record->completion);
             }
-            for (const auto& segment : graph.segments) {
+            for (size_t index = 0; index < graph.segments.size(); ++index) {
+                const auto& segment = graph.segments[index];
                 graph.last_event = state.current->queue.submit([&](sycl::handler& handler) {
                     if (!dependencies.empty())
                         handler.depends_on(dependencies);
                     handler.ext_oneapi_graph(*segment);
                 });
+                // Drain printing segments while Python log readers are alive, even without a later Warp wait.
+                if (graph.printing_segments[index])
+                    state.current->queue.wait_and_throw();
                 dependencies.clear();
             }
             for (const auto& marker : graph.events) {

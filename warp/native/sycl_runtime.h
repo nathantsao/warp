@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <new>
 #include <stdexcept>
@@ -86,6 +87,8 @@ WP_API int wp_sycl_graph_end(void* device, void* graph);
 WP_API int wp_sycl_graph_launch(void* device, void* graph);
 WP_API int wp_sycl_graph_destroy(void* device, void* graph);
 WP_API int wp_sycl_graph_memory_info(void* device, size_t* allocations, size_t* bytes);
+WP_API int wp_sycl_printf_begin(void* device);
+WP_API int wp_sycl_printf_end(void* device);
 }
 
 // Kernel arguments are passed by value up to this size; larger argument structs are staged in USM.
@@ -96,6 +99,26 @@ WP_API int wp_sycl_graph_memory_info(void* device, size_t* allocations, size_t* 
 namespace wp {
 
 void sycl_defer_resource(void* device, std::shared_ptr<void> resource);
+
+struct SyclPrintfScope {
+    void* device;
+    bool segmented;
+
+    explicit SyclPrintfScope(void* device)
+        : device(device)
+    {
+        const int result = wp_sycl_printf_begin(device);
+        if (result < 0)
+            throw std::runtime_error(wp_sycl_get_error_string());
+        segmented = result != 0;
+    }
+
+    ~SyclPrintfScope() noexcept(false)
+    {
+        if (segmented && wp_sycl_printf_end(device) < 0 && std::uncaught_exceptions() == 0)
+            throw std::runtime_error(wp_sycl_get_error_string());
+    }
+};
 
 inline void* sycl_stage_args(void* device, const void* src, size_t size)
 {

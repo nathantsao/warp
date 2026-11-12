@@ -363,6 +363,47 @@ def test_print_error_variadic_arg_count(test, device):
         )
 
 
+# Graph output must drain during replay, not at teardown after logging threads stop.
+def test_print_graph(test, device):
+    @wp.func
+    def graph_print_value(value: int):
+        wp.printf("graph value=%d\n", value)
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def graph_print_kernel(values: wp.array[int]):
+        values[0] += 1
+        graph_print_value(values[0])
+        wp.print(values[0])
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def graph_increment_kernel(values: wp.array[int]):
+        values[0] += 1
+
+    wp.load_module(module=graph_print_kernel.module, device=device)
+    wp.load_module(module=graph_increment_kernel.module, device=device)
+    values = wp.zeros(1, dtype=int, device=device)
+    event = wp.Event(device=device, enable_timing=True)
+    with wp.ScopedCapture(device=device) as child:
+        wp.launch(graph_print_kernel, dim=1, inputs=[values], device=device)
+    with wp.ScopedDevice(device), wp.ScopedCapture(device=device) as parent:
+        wp.launch(graph_increment_kernel, dim=1, inputs=[values], device=device)
+        wp.capture_launch(child.graph)
+        wp.record_event(event, external=True)
+        wp.launch(graph_increment_kernel, dim=1, inputs=[values], device=device)
+
+    for replay in range(2):
+        capture = StdOutCapture()
+        capture.begin()
+        try:
+            wp.capture_launch(parent.graph)
+        finally:
+            output = capture.end()
+        wp.synchronize_device(device)
+        printed_value = replay * 3 + 2
+        test.assertEqual(output, f"graph value={printed_value}{os.linesep}{printed_value}{os.linesep}")
+        np.testing.assert_array_equal(values.numpy(), [(replay + 1) * 3])
+
+
 class TestPrint(unittest.TestCase):
     pass
 
@@ -377,6 +418,15 @@ add_function_test(
     "test_print_error_variadic_arg_count",
     test_print_error_variadic_arg_count,
     devices=devices,
+    check_output=False,
+)
+
+# SYCL specific tests
+add_function_test(
+    TestPrint,
+    "test_print_graph",
+    test_print_graph,
+    devices=get_sycl_test_devices("all"),
     check_output=False,
 )
 
