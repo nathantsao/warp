@@ -77,6 +77,16 @@ def tile_upper_solve_vec_kernel(gU: wp.array2d[wp.float64], gz: wp.array1d[wp.fl
     wp.tile_store(gx, x)
 
 
+@wp.kernel(enable_backward=False, module="unique", module_options={"enable_mathdx_solver": False})
+def tile_upper_solve_vec_partial_kernel(
+    gU: wp.array2d[wp.float64], gz: wp.array1d[wp.float64], gx: wp.array1d[wp.float64]
+):
+    U = wp.tile_load(gU, shape=(33, 33))
+    z = wp.tile_load(gz, shape=33)
+    x = wp.tile_upper_solve(U, z)
+    wp.tile_store(gx, x)
+
+
 @wp.kernel(enable_backward=False)
 def tile_upper_solve_mat_kernel(gU: wp.array2d[wp.float64], gz: wp.array2d[wp.float64], gx: wp.array2d[wp.float64]):
     U = wp.tile_load(gU, shape=(N, N))
@@ -424,17 +434,19 @@ def test_lower_solve_backward_matrix_float32(test, device):
 
 
 def test_upper_solve_vector(test, device):
-    L_np = _spd_lower_factor(N, seed=5)
-    U_np = L_np.T  # upper triangular
-    z_np = np.arange(1.0, N + 1.0)
-    x_ref = np.linalg.solve(U_np, z_np)
+    for size, kernel in ((N, tile_upper_solve_vec_kernel), (33, tile_upper_solve_vec_partial_kernel)):
+        with test.subTest(n=size):
+            L_np = _spd_lower_factor(size, seed=5)
+            U_np = L_np.T  # upper triangular
+            z_np = np.arange(1.0, size + 1.0)
+            x_ref = np.linalg.solve(U_np, z_np)
 
-    U = _make_arr(U_np, wp.float64, device)
-    z = _make_arr(z_np, wp.float64, device)
-    x = wp.zeros(N, dtype=wp.float64, device=device)
+            U = _make_arr(U_np, wp.float64, device)
+            z = _make_arr(z_np, wp.float64, device)
+            x = wp.zeros(size, dtype=wp.float64, device=device)
 
-    wp.launch_tiled(tile_upper_solve_vec_kernel, dim=[1], inputs=[U, z, x], block_dim=TILE_DIM, device=device)
-    assert_np_equal(x.numpy(), x_ref, tol=1e-10)
+            wp.launch_tiled(kernel, dim=[1], inputs=[U, z, x], block_dim=TILE_DIM, device=device)
+            assert_np_equal(x.numpy(), x_ref, tol=1e-10)
 
 
 def test_upper_solve_matrix(test, device):

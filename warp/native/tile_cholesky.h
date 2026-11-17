@@ -8,13 +8,12 @@
 // Performance: cooperative scalar vs cuSolverDx (L40, sm_89, fp64, block_dim=32)
 //
 //   tile_cholesky  (factorization)
-//     n   mathdx (us)   scalar (us)   scalar/mathdx
-//     4         15.0          15.9         1.06x
-//     8         16.1          19.0         1.18x
-//    16         18.1          27.5         1.52x
-//    32         25.3          53.9         2.13x
-//    64         54.3         159.4         2.94x
-//
+//     n   mathdx (us)   scalar (us)   scalar/mathdx   SYCL B70 (us)*
+//     4         15.0          15.9         1.06x         16.1-19.0
+//     8         16.1          19.0         1.18x         15.4-16.5
+//    16         18.1          27.5         1.52x              24.3
+//    32         25.3          53.9         2.13x        84.9-113.9
+//    64         54.3         159.4         2.94x             244.0
 //   adj_tile_cholesky  (Murray 2016 derivative, gemm + 2 trsm composition)
 //     measured indirectly via tile_cholesky_solve (n=8, m_rhs=8, batch=64):
 //     mathdx 16.7us, scalar 21.1us, 1.27x; widens to 4.4x at n=64.
@@ -31,6 +30,20 @@
 // scalar path on a libmathdx-enabled build by setting the module option
 // `enable_mathdx_solver=False` (or globally via
 // `wp.config.enable_mathdx_solver = False`).
+//
+// * SYCL: Arc Pro B70, block_dim=32, batch=64.
+// n<=32 figures are from the original baseline. The n=64 result uses the
+// unchanged 8-column right-looking blocked path, remeasured on 2026-11-16.
+// Its 244.0 us is about 4.5x the historical L40 mathdx time of 54.3 us.
+// Ranges span medians from two runs; n=64 is one run. Each run uses
+// 10 warmups and 7 samples of 100 launches, all in FP64.
+// GPU event intervals include submission gaps; JIT and host copies excluded.
+// Provisional, non-isolated timings with substantial variability. Historical
+// L40 timing/workload provenance is incomplete: these are not matched-GPU
+// speedup ratios.
+// Reproduce: uv run tools/benchmark_sycl_cholesky.py --device sycl:0
+//   --dtype float64 --sizes 4 8 16 32 64 --block-dims 32 --batch 64
+//   --output /tmp/warp-b70-cholesky-fp64-table.json
 
 #pragma once
 
@@ -88,6 +101,154 @@ inline CUDA_CALLABLE void scalar_cholesky_impl(TileA& A, TileOut& Out)
     // Helper: index into the output triangle.
     // Lower: Out(row, col), Upper: Out(col, row)
     auto idx = [](int row, int col) { return Upper ? tile_coord(col, row) : tile_coord(row, col); };
+
+    // Custom SYCL kernel
+#if defined(__SYCL_DEVICE_ONLY__)
+    if constexpr ((sizeof(T) == 4 || sizeof(T) == 8) && n > 32 && n <= 96) {
+        constexpr int panel_size = 8;
+        for (int element = WP_TILE_THREAD_IDX; element < n * n; element += WP_TILE_BLOCK_DIM) {
+            const int row = element / n;
+            const int column = element % n;
+            if (row >= column)
+                Out.data(idx(row, column)) = A.data(idx(row, column));
+        }
+        WP_TILE_SYNC();
+        for (int panel = 0; panel < n; panel += panel_size) {
+            const int panel_end = panel + panel_size < n ? panel + panel_size : n;
+            if (WP_TILE_THREAD_IDX == 0) {
+                for (int column = panel; column < panel_end; ++column) {
+                    T diagonal = Out.data(idx(column, column));
+                    for (int previous = panel; previous < column; ++previous) {
+                        T value = Out.data(idx(column, previous));
+                        diagonal -= value * value;
+                    }
+                    diagonal = wp::sqrt(diagonal);
+                    Out.data(idx(column, column)) = diagonal;
+                    T inverse = T(1) / diagonal;
+                    for (int row = column + 1; row < panel_end; ++row) {
+                        T value = Out.data(idx(row, column));
+                        for (int previous = panel; previous < column; ++previous)
+                            value -= Out.data(idx(row, previous)) * Out.data(idx(column, previous));
+                        Out.data(idx(row, column)) = value * inverse;
+                    }
+                }
+            }
+            WP_TILE_SYNC();
+            for (int row = panel_end + WP_TILE_THREAD_IDX; row < n; row += WP_TILE_BLOCK_DIM) {
+                for (int column = panel; column < panel_end; ++column) {
+                    T value = Out.data(idx(row, column));
+                    for (int previous = panel; previous < column; ++previous)
+                        value -= Out.data(idx(row, previous)) * Out.data(idx(column, previous));
+                    Out.data(idx(row, column)) = value * (T(1) / Out.data(idx(column, column)));
+                }
+            }
+            WP_TILE_SYNC();
+            for (int row = panel_end + WP_TILE_THREAD_IDX; row < n; row += WP_TILE_BLOCK_DIM) {
+                for (int column = panel_end; column <= row; ++column) {
+                    T value = Out.data(idx(row, column));
+                    for (int previous = panel; previous < panel_end; ++previous)
+                        value -= Out.data(idx(row, previous)) * Out.data(idx(column, previous));
+                    Out.data(idx(row, column)) = value;
+                }
+            }
+            WP_TILE_SYNC();
+        }
+        for (int element = WP_TILE_THREAD_IDX; element < n * n; element += WP_TILE_BLOCK_DIM) {
+            const int row = element / n;
+            const int column = element % n;
+            if (column > row)
+                Out.data(idx(row, column)) = T {};
+        }
+        WP_TILE_SYNC();
+        return;
+    }
+    if constexpr ((sizeof(T) == 4 || sizeof(T) == 8) && n >= 16 && n <= 32) {
+        constexpr int row_slots = (n + 15) / 16;
+        auto subgroup = wp::sycl_work_item().get_sub_group();
+        const int width = int(subgroup.get_local_linear_range());
+        if (width >= 16) {
+            const int lane = int(subgroup.get_local_linear_id());
+            const bool active = subgroup.get_group_linear_id() == 0;
+            T rows[row_slots][n] = {};
+            if (active) {
+#pragma unroll
+                for (int slot = 0; slot < row_slots; ++slot) {
+                    const int row = lane + slot * width;
+                    if (row < n) {
+#pragma unroll
+                        for (int k = 0; k < n; ++k) {
+                            if (k <= row)
+                                rows[slot][k] = A.data(idx(row, k));
+                        }
+                    }
+                }
+            }
+            WP_TILE_SYNC();
+            if (active) {
+#pragma unroll
+                for (int j = 0; j < n; ++j) {
+                    const int owner = j % width;
+                    const int pivot_slot = j / width;
+                    T diagonal = T {};
+                    if (lane == owner) {
+#pragma unroll
+                        for (int slot = 0; slot < row_slots; ++slot) {
+                            if (slot == pivot_slot) {
+                                diagonal = rows[slot][j];
+#pragma unroll
+                                for (int k = 0; k < j; ++k) {
+                                    T value = rows[slot][k];
+                                    diagonal -= value * value;
+                                }
+                            }
+                        }
+                        diagonal = wp::sqrt(diagonal);
+                    }
+                    diagonal = sycl::group_broadcast(subgroup, diagonal, owner);
+                    T sums[row_slots];
+#pragma unroll
+                    for (int slot = 0; slot < row_slots; ++slot)
+                        sums[slot] = rows[slot][j];
+#pragma unroll
+                    for (int k = 0; k < j; ++k) {
+                        T value = T {};
+#pragma unroll
+                        for (int slot = 0; slot < row_slots; ++slot) {
+                            if (slot == pivot_slot)
+                                value = rows[slot][k];
+                        }
+                        T coefficient = sycl::group_broadcast(subgroup, value, owner);
+#pragma unroll
+                        for (int slot = 0; slot < row_slots; ++slot) {
+                            if (lane + slot * width > j)
+                                sums[slot] -= rows[slot][k] * coefficient;
+                        }
+                    }
+                    T inverse = T(1) / diagonal;
+#pragma unroll
+                    for (int slot = 0; slot < row_slots; ++slot) {
+                        const int row = lane + slot * width;
+                        if (row == j)
+                            rows[slot][j] = diagonal;
+                        else if (row > j)
+                            rows[slot][j] = sums[slot] * inverse;
+                    }
+                }
+#pragma unroll
+                for (int slot = 0; slot < row_slots; ++slot) {
+                    const int row = lane + slot * width;
+                    if (row < n) {
+#pragma unroll
+                        for (int k = 0; k < n; ++k)
+                            Out.data(idx(row, k)) = k <= row ? rows[slot][k] : T {};
+                    }
+                }
+            }
+            WP_TILE_SYNC();
+            return;
+        }
+    }
+#endif
 
     for (int j = 0; j < n; ++j) {
         // Diagonal: redundant compute on all threads.

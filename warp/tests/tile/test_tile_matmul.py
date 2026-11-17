@@ -69,6 +69,30 @@ def test_tile_grouped_gemm(test, device):
     assert_np_equal(C_wp.numpy(), C, 1e-6)
 
 
+def test_tile_matmul_fp32_extreme_values(test, device):
+    """Preserve finite FP32 products at exponent extremes on every backend."""
+    batch_count = 56
+    cases = (
+        (np.finfo(np.float32).max, np.float32(0.25)),
+        (np.finfo(np.float32).max, np.float32(0.0)),
+        (np.nextafter(np.float32(0.0), np.float32(1.0)), np.float32(2.0**126)),
+    )
+    input_a = np.zeros((batch_count, TILE_M, TILE_K), dtype=np.float32)
+    input_b = np.zeros((batch_count, TILE_K, TILE_N), dtype=np.float32)
+    for matrix in range(batch_count):
+        input_a[matrix, 0, 0], input_b[matrix, 0, 0] = cases[matrix % len(cases)]
+    reference = (input_a.astype(np.float64) @ input_b.astype(np.float64)).astype(np.float32)
+    array_a = wp.array(input_a, device=device)
+    array_b = wp.array(input_b, device=device)
+    array_c = wp.zeros((batch_count, TILE_M, TILE_N), dtype=wp.float32, device=device)
+    wp.launch_tiled(
+        tile_grouped_gemm, dim=[batch_count], inputs=[array_a, array_b, array_c], block_dim=TILE_DIM, device=device
+    )
+    result = array_c.numpy()
+    test.assertTrue(np.isfinite(result).all())
+    np.testing.assert_array_equal(result, reference)
+
+
 @wp.kernel
 def tile_gemm(A: wp.array2d[Any], B: wp.array2d[Any], C: wp.array2d[Any]):
     # output tile index
@@ -1091,6 +1115,9 @@ add_function_test(
 add_function_test(TestTileMatmul, "test_tile_gemm_fp32", test_tile_gemm(wp.float32), devices=devices)
 add_function_test(TestTileMatmul, "test_tile_gemm_fp64", test_tile_gemm(wp.float64), devices=devices)
 add_function_test(TestTileMatmul, "test_tile_grouped_gemm", test_tile_grouped_gemm, devices=devices)
+add_function_test(
+    TestTileMatmul, "test_tile_matmul_fp32_extreme_values", test_tile_matmul_fp32_extreme_values, devices=devices
+)
 add_function_test(
     TestTileMatmul,
     "test_tile_matmul_mixed_precision",

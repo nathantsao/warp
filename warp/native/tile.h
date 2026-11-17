@@ -1849,10 +1849,25 @@ template <typename T, typename L, bool Owner_ = true> struct tile_shared_t {
         if (initialized)
             WP_TILE_SYNC();
 
-        WP_PRAGMA_UNROLL
-        for (int i = WP_TILE_THREAD_IDX; i < Layout::Size; i += WP_TILE_BLOCK_DIM) {
-            auto c = Layout::coord_from_linear(i);
-            data(c) = tile.data(c);
+#if defined(__SYCL_DEVICE_ONLY__)
+        if constexpr (Layout::Shape::N == 1 && !Layout::Aligned) {
+            constexpr int iterations = (Layout::Size + WP_TILE_BLOCK_DIM - 1) / WP_TILE_BLOCK_DIM;
+            WP_PRAGMA_UNROLL
+            for (int iteration = 0; iteration < iterations; ++iteration) {
+                const int linear = WP_TILE_THREAD_IDX + iteration * WP_TILE_BLOCK_DIM;
+                if (linear < Layout::Size) {
+                    auto coord = Layout::coord_from_linear(linear);
+                    data(coord) = tile.data(coord);
+                }
+            }
+        } else
+#endif
+        {
+            WP_PRAGMA_UNROLL
+            for (int i = WP_TILE_THREAD_IDX; i < Layout::Size; i += WP_TILE_BLOCK_DIM) {
+                auto c = Layout::coord_from_linear(i);
+                data(c) = tile.data(c);
+            }
         }
 
         initialized = true;

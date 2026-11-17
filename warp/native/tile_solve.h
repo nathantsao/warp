@@ -9,20 +9,20 @@
 // block_dim=32, m_rhs=8, batch=64)
 //
 //   tile_lower_solve  (matrix RHS)
-//     n   mathdx (us)   scalar (us)   scalar/mathdx
-//     4         16.2          16.6         1.02x
-//     8         16.2          18.2         1.12x
-//    16         16.9          22.9         1.35x
-//    32         19.3          36.8         1.90x
-//    64         26.8          83.3         3.11x
+//     n   mathdx (us)   scalar (us)   scalar/mathdx   SYCL B70 (us)*
+//     4         16.2          16.6         1.02x              13.1
+//     8         16.2          18.2         1.12x              14.4
+//    16         16.9          22.9         1.35x              17.5
+//    32         19.3          36.8         1.90x              24.3
+//    64         26.8          83.3         3.11x             263.1
 //
 //   tile_cholesky_solve  (full LL^T solve = forward + back substitution)
-//     n   mathdx (us)   scalar (us)   scalar/mathdx
-//     4         16.1          17.2         1.07x
-//     8         16.7          21.1         1.27x
-//    16         18.4          30.3         1.65x
-//    32         22.4          58.0         2.60x
-//    64         34.7         153.3         4.42x
+//     n   mathdx (us)   scalar (us)   scalar/mathdx   SYCL B70 (us)*
+//     4         16.1          17.2         1.07x              13.8
+//     8         16.7          21.1         1.27x              14.6
+//    16         18.4          30.3         1.65x              21.2
+//    32         22.4          58.0         2.60x              71.6
+//    64         34.7         153.3         4.42x            1525.9
 //
 // cuSolverDx wins at every size we measured. The gap is within noise at n<=8,
 // modest at n=16 (~1.4x for trsm, ~1.7x for cholesky_solve), and grows
@@ -37,6 +37,22 @@
 // scalar path on a libmathdx-enabled build by setting the module option
 // `enable_mathdx_solver=False` (or globally via
 // `wp.config.enable_mathdx_solver = False`).
+//
+// * SYCL: Arc Pro B70, FP64, block_dim=32, m_rhs=8, batch=64.
+// Solve-only kernels load precomputed lower factors and RHS, then store results;
+// factorization is excluded. Matrix-RHS forward substitution uses 8-row register
+// panels at n>=16. At n=64, matrix-RHS back substitution uses four lanes per
+// column, with register residuals and subgroup broadcasts; other sizes retain
+// scalar column-parallel back substitution. The n=64 full solve measured
+// 1302.6-1525.9 us across two retained-path runs, versus 1831.2 us before this
+// change. The 613.2 us target (4x historical L40 scalar) has not been reached.
+// Values are medians from one run: 10 warmups, 7 samples of 100 launches.
+// GPU event intervals include submission gaps; JIT and host copies excluded.
+// Provisional, non-isolated timings. Historical L40 timing/workload provenance
+// is incomplete: these are not matched-GPU speedup ratios.
+// Reproduce: uv run tools/benchmark_sycl_cholesky.py --operation solves
+//   --device sycl:0 --dtype float64 --sizes 4 8 16 32 64 --block-dims 32
+//   --batch 64 --output /tmp/warp-b70-solves-fp64-table.json
 
 #pragma once
 
@@ -81,6 +97,58 @@ inline CUDA_CALLABLE void scalar_cholesky_forward_substitution(TileA& A, TileX& 
     if constexpr (TileY::Layout::Shape::N == 1) {
         constexpr int n = TileA::Layout::Shape::dim(1);
 
+#if defined(__SYCL_DEVICE_ONLY__)
+        if constexpr ((sizeof(T) == 4 || sizeof(T) == 8) && n >= 16 && n <= 128) {
+            constexpr int row_slots = (n + 15) / 16;
+            auto subgroup = wp::sycl_work_item().get_sub_group();
+            const int width = int(subgroup.get_local_linear_range());
+            if (width >= 16) {
+                const int lane = int(subgroup.get_local_linear_id());
+                const bool active = subgroup.get_group_linear_id() == 0;
+                T residuals[row_slots] = {};
+                if (active) {
+#pragma unroll
+                    for (int slot = 0; slot < row_slots; ++slot) {
+                        const int row = lane + slot * width;
+                        if (row < n)
+                            residuals[slot] = Y.data(tile_coord(row));
+                    }
+                }
+                WP_TILE_SYNC();
+                if (active) {
+                    for (int column = 0; column < n; ++column) {
+                        T solution = T {};
+                        if (lane == column % width) {
+#pragma unroll
+                            for (int slot = 0; slot < row_slots; ++slot) {
+                                if (slot == column / width) {
+                                    T diagonal = A.data(idx(column, column));
+                                    solution = diagonal != T {} ? residuals[slot] / diagonal : residuals[slot];
+                                    residuals[slot] = solution;
+                                }
+                            }
+                        }
+                        solution = sycl::group_broadcast(subgroup, solution, column % width);
+#pragma unroll
+                        for (int slot = 0; slot < row_slots; ++slot) {
+                            const int row = lane + slot * width;
+                            if (row > column && row < n)
+                                residuals[slot] -= A.data(idx(row, column)) * solution;
+                        }
+                    }
+#pragma unroll
+                    for (int slot = 0; slot < row_slots; ++slot) {
+                        const int row = lane + slot * width;
+                        if (row < n)
+                            X.data(tile_coord(row)) = residuals[slot];
+                    }
+                }
+                WP_TILE_SYNC();
+                return;
+            }
+        }
+#endif
+
         if (WP_TILE_THREAD_IDX == 0) {
             for (int i = 0; i < n; ++i) {
                 T s = Y.data(tile_coord(i));
@@ -96,6 +164,45 @@ inline CUDA_CALLABLE void scalar_cholesky_forward_substitution(TileA& A, TileX& 
     } else if constexpr (TileY::Layout::Shape::N == 2) {
         constexpr int n = TileA::Layout::Shape::dim(1);
         constexpr int m = TileY::Layout::Shape::dim(1);
+
+#if defined(__SYCL_DEVICE_ONLY__)
+        if constexpr ((sizeof(T) == 4 || sizeof(T) == 8) && n >= 16 && n <= 96) {
+            constexpr int panel_size = 8;
+            for (int column = WP_TILE_THREAD_IDX; column < m; column += WP_TILE_BLOCK_DIM) {
+                for (int panel = 0; panel < n; panel += panel_size) {
+                    T residuals[panel_size] = {};
+#pragma unroll
+                    for (int slot = 0; slot < panel_size; ++slot) {
+                        if (panel + slot < n)
+                            residuals[slot] = Y.data(tile_coord(panel + slot, column));
+                    }
+                    for (int previous = 0; previous < panel; ++previous) {
+                        T solution = X.data(tile_coord(previous, column));
+#pragma unroll
+                        for (int slot = 0; slot < panel_size; ++slot) {
+                            if (panel + slot < n)
+                                residuals[slot] -= A.data(idx(panel + slot, previous)) * solution;
+                        }
+                    }
+#pragma unroll
+                    for (int slot = 0; slot < panel_size; ++slot) {
+                        const int row = panel + slot;
+                        if (row < n) {
+                            T value = residuals[slot];
+#pragma unroll
+                            for (int previous = 0; previous < slot; ++previous)
+                                value -= A.data(idx(row, panel + previous)) * residuals[previous];
+                            T diagonal = A.data(idx(row, row));
+                            residuals[slot] = diagonal != T {} ? value / diagonal : value;
+                            X.data(tile_coord(row, column)) = residuals[slot];
+                        }
+                    }
+                }
+            }
+            WP_TILE_SYNC();
+            return;
+        }
+#endif
 
         for (int k = WP_TILE_THREAD_IDX; k < m; k += WP_TILE_BLOCK_DIM) {
             for (int i = 0; i < n; ++i) {
@@ -143,6 +250,60 @@ inline CUDA_CALLABLE void scalar_cholesky_back_substitution(TileA& A, TileX& X)
     } else if constexpr (TileX::Layout::Shape::N == 2) {
         constexpr int n = TileA::Layout::Shape::dim(1);
         constexpr int m = TileX::Layout::Shape::dim(1);
+
+#if defined(__SYCL_DEVICE_ONLY__)
+        if constexpr ((sizeof(T) == 4 || sizeof(T) == 8) && n == 64 && WP_TILE_BLOCK_DIM % 4 == 0) {
+            constexpr int lanes_per_column = 4;
+            constexpr int row_slots = (n + lanes_per_column - 1) / lanes_per_column;
+            auto subgroup = wp::sycl_work_item().get_sub_group();
+            const int width = int(subgroup.get_local_linear_range());
+            if (width >= lanes_per_column && width % lanes_per_column == 0) {
+                const int lane = WP_TILE_THREAD_IDX % lanes_per_column;
+                const int subgroup_base = int(subgroup.get_local_linear_id()) - lane;
+                WP_TILE_SYNC();
+                for (int base = 0; base < m; base += WP_TILE_BLOCK_DIM / lanes_per_column) {
+                    const int column = base + WP_TILE_THREAD_IDX / lanes_per_column;
+                    T residuals[row_slots] = {};
+#pragma unroll
+                    for (int slot = 0; slot < row_slots; ++slot) {
+                        const int row = lane + slot * lanes_per_column;
+                        if (column < m && row < n)
+                            residuals[slot] = X.data(tile_coord(row, column));
+                    }
+                    for (int solved_row = n - 1; solved_row >= 0; --solved_row) {
+                        T solution = T {};
+                        if (column < m && lane == solved_row % lanes_per_column) {
+#pragma unroll
+                            for (int slot = 0; slot < row_slots; ++slot) {
+                                if (slot == solved_row / lanes_per_column) {
+                                    T diagonal = A.data(idx(solved_row, solved_row));
+                                    solution = diagonal != T {} ? residuals[slot] / diagonal : residuals[slot];
+                                    residuals[slot] = solution;
+                                }
+                            }
+                        }
+                        solution = sycl::select_from_group(
+                            subgroup, solution, subgroup_base + solved_row % lanes_per_column
+                        );
+#pragma unroll
+                        for (int slot = 0; slot < row_slots; ++slot) {
+                            const int row = lane + slot * lanes_per_column;
+                            if (column < m && row < solved_row)
+                                residuals[slot] -= A.data(idx(row, solved_row)) * solution;
+                        }
+                    }
+#pragma unroll
+                    for (int slot = 0; slot < row_slots; ++slot) {
+                        const int row = lane + slot * lanes_per_column;
+                        if (column < m && row < n)
+                            X.data(tile_coord(row, column)) = residuals[slot];
+                    }
+                }
+                WP_TILE_SYNC();
+                return;
+            }
+        }
+#endif
 
         for (int k = WP_TILE_THREAD_IDX; k < m; k += WP_TILE_BLOCK_DIM) {
             for (int i = n - 1; i >= 0; --i) {
