@@ -29,14 +29,22 @@ template <typename T, typename Op> inline T sycl_atomic_update(T* address, Op op
 
 template <typename T> inline T atomic_add(T* address, T value)
 {
-    return sycl_atomic_update(address, [=](T old) {
-        if constexpr (std::is_integral_v<T>) {
-            using Unsigned = std::make_unsigned_t<T>;
-            return sycl::bit_cast<T>(Unsigned(Unsigned(old) + Unsigned(value)));
-        } else {
-            return T(old + value);
-        }
-    });
+    // Native fetch_add avoids a compare-exchange retry loop on hot shared counters.
+    if constexpr ((std::is_integral_v<T> || std::is_floating_point_v<T>) && (sizeof(T) == 4 || sizeof(T) == 8)) {
+        sycl::atomic_ref<
+            T, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::generic_space>
+            ref(*address);
+        return ref.fetch_add(value);
+    } else {
+        return sycl_atomic_update(address, [=](T old) {
+            if constexpr (std::is_integral_v<T>) {
+                using Unsigned = std::make_unsigned_t<T>;
+                return sycl::bit_cast<T>(Unsigned(Unsigned(old) + Unsigned(value)));
+            } else {
+                return T(old + value);
+            }
+        });
+    }
 }
 
 template <typename T> inline T atomic_min(T* address, T value)
